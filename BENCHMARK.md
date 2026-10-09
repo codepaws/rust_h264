@@ -374,13 +374,15 @@ medium, no-deblock). `--threads N` uses `ThreadedDecoder`; `threads=1` is
 The streams above disable the in-loop deblocking filter
 (`--no-deblock`). Real-world content uses it, and
 deblocking has no SIMD yet. Streams regenerated without `no-deblock`
-(`testdata/deb_*.h264`, regenerable with the commands below; not
-committed):
+(`testdata/deb_*.h264`, committed for reproduction; regeneration
+commands below):
 
 ```bash
 ffmpeg -f lavfi -i "testsrc2=s=1920x1080:rate=30:duration=3.33" -frames:v 100   -c:v libx264 -preset medium -crf 23 -x264opts "bframes=3:ref=2" -f h264 deb_1080p_100f.h264
 ffmpeg -f lavfi -i "testsrc2=s=1280x720:rate=30:duration=10" -frames:v 300   -c:v libx264 -preset medium -crf 23 -x264opts "bframes=3:ref=4" -f h264 deb_720p_300f_bframes.h264
 ffmpeg -f lavfi -i "testsrc2=s=1280x720:rate=30:duration=10" -frames:v 300   -c:v libx264 -preset medium -crf 23 -x264opts "bframes=0:ref=1" -f h264 deb_720p_300f_ponly.h264
+# deb_854x480_crop.h264: non-MB-aligned width (exercises cropping)
+ffmpeg -f lavfi -i "testsrc2=s=854x480:rate=30:duration=4" -frames:v 120   -c:v libx264 -preset medium -crf 23 -x264opts "bframes=3:ref=2" -f h264 deb_854x480_crop.h264
 ```
 
 | Stream | rust_h264 1t | rust_h264 4t | FFmpeg `-threads 1` | FFmpeg / rust_h264 4t |
