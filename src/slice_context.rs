@@ -412,10 +412,9 @@ impl SliceContext<'_> {
                 wctx.apply_uni(&mut luma_pred, 0, 0, false, 0);
             }
             for r in 0..16 {
-                for c in 0..16 {
-                    self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c] =
-                        luma_pred[r * 16 + c];
-                }
+                let src = &luma_pred[r * 16..r * 16 + 16];
+                let dst_off = self.ly_offset + r * self.ly_stride + mb_x;
+                self.frame.y[dst_off..dst_off + 16].copy_from_slice(src);
             }
             // Chroma MC
             let cw = c_ref_stride;
@@ -457,10 +456,11 @@ impl SliceContext<'_> {
                 wctx.apply_uni(&mut cr_pred, 0, 0, true, 1);
             }
             for r in 0..8 {
-                for c in 0..8 {
-                    self.frame.u[cbase + r * cstride + cx + c] = cb_pred[r * 8 + c];
-                    self.frame.v[cbase + r * cstride + cx + c] = cr_pred[r * 8 + c];
-                }
+                let (s1, s2) = (&cb_pred[r * 8..r * 8 + 8], &cr_pred[r * 8..r * 8 + 8]);
+                let o1 = cbase + r * cstride + cx;
+                let o2 = cbase + r * cstride + cx;
+                self.frame.u[o1..o1 + 8].copy_from_slice(s1);
+                self.frame.v[o2..o2 + 8].copy_from_slice(s2);
             }
         }
         // Store MVs and ref indices
@@ -775,10 +775,9 @@ impl SliceContext<'_> {
             }
         }
         for r in 0..16 {
-            for c in 0..16 {
-                self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c] =
-                    luma_pred[r * 16 + c];
-            }
+            let src = &luma_pred[r * 16..r * 16 + 16];
+            let dst_off = self.ly_offset + r * self.ly_stride + mb_x;
+            self.frame.y[dst_off..dst_off + 16].copy_from_slice(src);
         }
 
         // Chroma MC: per-4x4-block
