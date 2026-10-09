@@ -27,7 +27,7 @@ impl SliceType {
 }
 
 /// Slice header (H.264 spec section 7.3.3).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SliceHeader {
     pub first_mb_in_slice: u32,
     pub slice_type: SliceType,

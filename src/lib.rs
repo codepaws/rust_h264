@@ -96,6 +96,7 @@ mod slice_context;
 
 #[cfg(target_arch = "x86_64")]
 mod simd_x86;
+pub mod threading;
 
 /// Force (or re-enable) scalar code paths, process-wide. Used by the
 /// benchmark and test tooling to A/B measure SIMD acceleration; no effect

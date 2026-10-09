@@ -2,7 +2,7 @@ use crate::bitstream::BitstreamReader;
 use crate::sps::Sps;
 
 /// Picture Parameter Set (H.264 spec section 7.3.2.2).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Pps {
     pub pic_parameter_set_id: u32,
     pub seq_parameter_set_id: u32,

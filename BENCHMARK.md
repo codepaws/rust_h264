@@ -298,3 +298,73 @@ Now measured at **112 fps (1080p)** and **254-390 fps (720p)** on realistic
 **720p** is **8.5x realtime** at 30fps (254 fps with B-frames).
 **1080p** is **3.7x realtime** at 30fps (112 fps), **1.9x at 60fps**.
 Items 7-9 would increase 1080p headroom to ~150+ fps.
+
+## x86-64 results (Windows, SIMD + frame threading)
+
+Test machine: x86-64 desktop, rustc 1.95, `cargo build --release` (default
+`target-cpu`, no `native`). Streams as above (`testsrc2`, x264 preset
+medium, no-deblock). `--threads N` uses `ThreadedDecoder`; `threads=1` is
+`OrderedDecoder`.
+
+### Throughput (best of 3)
+
+| Stream | scalar (pre-SIMD) | SIMD, 1 thread | SIMD, 2 threads | SIMD, 4 threads | SIMD, 8 threads |
+|--------|------------------:|---------------:|----------------:|----------------:|----------------:|
+| 1080p B-frames (100f) | 74 fps | 83 fps | 93 fps | **122 fps** | 121 fps |
+| 720p B-frames (300f)  | 196 fps | 227 fps | — | **331 fps** | — |
+| 720p P-only (300f)    | 312 fps | 318 fps | — | 339 fps | — |
+
+- **SIMD alone: ~8-9%** end-to-end, even though the hand kernels are
+  6.6-8.5x faster than true scalar in microbenchmarks. The reason: LLVM
+  already auto-vectorizes the row-based scalar loops with SSE2 at the
+  x86-64 baseline (optimization #9 restructured them for exactly that), so
+  the hand-written SSE2 mostly matches what the compiler emitted. Gains
+  beyond auto-vec require instructions the compiler cannot use in generic
+  builds (SSSE3 `pmaddubsw` chroma, AVX2/AVX-512 `pavgb` bi-pred, which
+  are gated at runtime).
+- **Frame threading: 1.46-1.47x at 4 threads** on B-frame content, and
+  ~1x on P-only chains — P-pictures reference their immediate
+  predecessor, so the dependency chain serializes regardless of thread
+  count. This matches the structure FFmpeg's frame-threaded decoder
+  exploits; row-level reference synchronization (decoding a dependent
+  picture before its reference is fully finished) is future work.
+- Combined effect vs the scalar single-threaded baseline on this machine:
+  **74 -> 122 fps at 1080p (1.65x)**.
+
+### x86-64 SIMD implementation notes
+
+- `src/simd_x86.rs`: runtime level detection (`SimdLevel`: Sse2 baseline,
+  Ssse3, Sse41, Avx2, Avx512 — AVX-512 gated on BW+VL+F), cached in a
+  `OnceLock`; per-kernel dispatch, no per-macroblock detection.
+  `set_force_scalar(true)` A/B switch (used by `bench_decode --scalar`).
+- All kernels bit-exact with scalar references: half-pel FIR in i16 lanes
+  (max |acc| 10,710), diagonal two-pass in i16 staging + i32 `madd`
+  vertical, quarter-pel `pavgb` after per-operand saturation
+  (clip-then-average), chroma `pmaddubsw` (weights sum to 64, no clamp
+  needed). Verified by differential unit tests plus the full byte-exact
+  test corpus.
+- YUV→RGB display conversion in `play` uses an AVX2 path (8 px/iter, i32
+  lanes, u32 pixels stored directly).
+
+### Threading implementation notes (`src/threading.rs`)
+
+- Frame-level pipelining: the coordinator runs all header-level work in
+  coded order (slice-header parse, POC, reference-list construction)
+  against a shadow DPB of *planned* pictures (`Dpb<PlannedPic>` — the DPB
+  is generic over a `PicRef` trait). Workers run per-picture MB decode +
+  deblocking; commits are strictly coded-ordered, and a picture's worker
+  waits until all its references are committed (full-frame granularity).
+- Byte-exactness: the shadow DPB replays the serial decoder's insert /
+  sliding-window / MMCO sequence with the same metadata in the same order,
+  so reference lists are identical by construction. The reorder buffer
+  replicates `OrderedDecoder` semantics exactly (per-push depth pops,
+  IDR-GOP membership of the IDR frame, POC-sorted batch drains at GOP
+  completion) — the test suite decodes every multi-frame `testdata`
+  stream through 2- and 4-thread pipelines and asserts bit-identical
+  output.
+- Field pictures are not supported by `ThreadedDecoder` (returns an
+  error; use the serial `Decoder`). MBAFF frame pictures work.
+- Known follow-ups: worker thread pool instead of spawn-per-picture,
+  row-level reference sync (FFmpeg-style) to overlap dependent pictures,
+  deblock/IDCT/intra-prediction SIMD, block-fused MC kernels (the
+  `luma_mc` dispatch overhead noted above).

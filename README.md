@@ -12,6 +12,8 @@ Supports Baseline, Main, and High profiles (8-bit 4:2:0) with CAVLC and CABAC en
 - **Input:** Both Annex B (start code delimited `00 00 00 01` / `00 00 01`) and AVCC (length-prefixed, used inside MP4/MKV containers) bitstreams are supported. The decoder itself accepts `NalUnit` values; the choice of parser determines the input format.
 - **Streaming:** The decoder exposes a streaming API. NAL units are fed incrementally and decoded frames are emitted as they become available.
 - **Performance:** The decoder aims to be fast, with performance relative to ffmpeg's software H.264 decoder as the target benchmark.
+- **SIMD:** Runtime-dispatched SSE2/SSSE3/AVX2/AVX-512 kernels on x86-64 (bit-exact with the scalar paths; see `BENCHMARK.md`), NEON on aarch64.
+- **Threading:** `threading::ThreadedDecoder` pipelines pictures across worker threads with output bit-identical to the serial decoder. Best on B-frame content (~1.5x at 4 threads); P-only chains are dependency-bound. Field pictures require the serial `Decoder`.
 
 ## Usage
 
@@ -141,12 +143,15 @@ for frame in decoder.flush() {
 Decode and display an H.264 bitstream in a window:
 
 ```
-cargo run --example play -- input.h264 [--fps 30] [--loop]
+cargo run --example play -- input.h264 [--fps 30] [--loop] [--threads N] [--scalar]
 ```
 
-- `--fps N` — set playback frame rate (default: 30)
+- `--fps N` — set playback frame rate (default: SPS VUI timing, else 30)
 - `--loop` — loop playback continuously
-- Press Escape to quit
+- `--threads N` — decode with N threads (`ThreadedDecoder`; default 1)
+- `--scalar` — force scalar code paths (A/B testing)
+- Keys: Space pause · Right step frame · D dump frame as YUV · Escape quit
+- Window title shows decode/display fps, queue depth and frame counters
 
 ### Dump frames
 

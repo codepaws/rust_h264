@@ -22,7 +22,7 @@ pub const DEFAULT_SCALING_4X4_INTER: [u8; 16] = [
 pub const FLAT_SCALING_4X4: [u8; 16] = [16; 16];
 
 /// Sequence Parameter Set (H.264 spec section 7.3.2.1).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Sps {
     pub profile_idc: u8,
     pub constraint_set0_flag: bool,

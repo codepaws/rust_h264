@@ -3,7 +3,7 @@
 //! Contains MV prediction (median, directional), spatial/temporal direct mode,
 //! MV neighbor lookups, skip MV derivation, and weighted prediction context.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::dpb::DecodedPicture;
 use crate::inter_pred;
@@ -127,7 +127,7 @@ pub(crate) fn predict_mv_sub(
 /// Safely index a ref pic list, clamping out-of-range indices to the last entry.
 /// Returns `None` if the list is empty (malformed bitstream).
 #[inline]
-pub(crate) fn ref_pic_safe(list: &[Rc<DecodedPicture>], idx: i8) -> Option<&Rc<DecodedPicture>> {
+pub(crate) fn ref_pic_safe(list: &[Arc<DecodedPicture>], idx: i8) -> Option<&Arc<DecodedPicture>> {
     if list.is_empty() {
         return None;
     }
@@ -529,7 +529,7 @@ pub(crate) fn derive_spatial_direct_blk(
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(crate) fn derive_temporal_direct_blk(
     col_pic: &DecodedPicture,
-    ref_pic_list_l0: &[Rc<DecodedPicture>],
+    ref_pic_list_l0: &[Arc<DecodedPicture>],
     current_poc: i32,
     col_poc: i32,
     mb_idx: usize,

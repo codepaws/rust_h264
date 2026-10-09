@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::bitstream::BitstreamReader;
 use crate::deblock::{self, MbInfo, MbType};
@@ -10,7 +10,7 @@ use crate::error::DecodeError;
 use crate::mv_pred::WeightContext;
 use crate::nal::{NalUnit, NalUnitType};
 use crate::pps::{parse_pps, Pps};
-use crate::slice::{parse_slice_header, SliceType};
+use crate::slice::{parse_slice_header, SliceHeader, SliceType};
 use crate::slice_context::{SliceContext, SliceParams};
 use crate::sps::{parse_sps, Sps};
 
@@ -43,64 +43,64 @@ pub struct Frame {
 
 /// In-progress picture state shared across slices within the same frame.
 #[derive(Clone)]
-struct PictureState {
-    frame: Frame,
-    frame_num: u32,
-    poc: i32,
-    nal_unit_type: NalUnitType,
-    nal_ref_idc: u8,
+pub(crate) struct PictureState {
+    pub(crate) frame: Frame,
+    pub(crate) frame_num: u32,
+    pub(crate) poc: i32,
+    pub(crate) nal_unit_type: NalUnitType,
+    pub(crate) nal_ref_idc: u8,
     // Per-MB arrays that persist across slices
-    nc_luma: Vec<u8>,
-    nc_cb: Vec<u8>,
-    nc_cr: Vec<u8>,
-    mv_store_l0: Vec<[i16; 2]>,
-    mv_store_l1: Vec<[i16; 2]>,
-    ref_idx_store_l0: Vec<i8>,
-    ref_poc_store_l0: Vec<i32>,
-    ref_idx_store_l1: Vec<i8>,
-    mvd_store: Vec<[i16; 2]>,
-    mvd_store_l1: Vec<[i16; 2]>,
-    mb_info: Vec<deblock::MbInfo>,
-    i4x4_modes: Vec<u8>,
+    pub(crate) nc_luma: Vec<u8>,
+    pub(crate) nc_cb: Vec<u8>,
+    pub(crate) nc_cr: Vec<u8>,
+    pub(crate) mv_store_l0: Vec<[i16; 2]>,
+    pub(crate) mv_store_l1: Vec<[i16; 2]>,
+    pub(crate) ref_idx_store_l0: Vec<i8>,
+    pub(crate) ref_poc_store_l0: Vec<i32>,
+    pub(crate) ref_idx_store_l1: Vec<i8>,
+    pub(crate) mvd_store: Vec<[i16; 2]>,
+    pub(crate) mvd_store_l1: Vec<[i16; 2]>,
+    pub(crate) mb_info: Vec<deblock::MbInfo>,
+    pub(crate) i4x4_modes: Vec<u8>,
     // CABAC neighbor context state
-    mb_cbp: Vec<u16>,
-    mb_chroma_pred: Vec<u8>,
-    mb_is_8x8dct: Vec<bool>,
-    mb_skip: Vec<bool>,
-    mb_is_direct: Vec<bool>,
-    blk_is_direct: Vec<bool>,
-    is_i16x16: Vec<bool>,
+    pub(crate) mb_cbp: Vec<u16>,
+    pub(crate) mb_chroma_pred: Vec<u8>,
+    pub(crate) mb_is_8x8dct: Vec<bool>,
+    pub(crate) mb_skip: Vec<bool>,
+    pub(crate) mb_is_direct: Vec<bool>,
+    pub(crate) blk_is_direct: Vec<bool>,
+    pub(crate) is_i16x16: Vec<bool>,
     /// Per-MB slice ID for slice boundary detection. MBs from different
     /// slices are treated as unavailable for CABAC context and MV prediction.
-    mb_slice_id: Vec<u16>,
+    pub(crate) mb_slice_id: Vec<u16>,
     /// Current slice ID counter (incremented for each new slice).
-    current_slice_id: u16,
+    pub(crate) current_slice_id: u16,
     #[allow(dead_code)]
-    prev_mb_qp: i32,
+    pub(crate) prev_mb_qp: i32,
     #[allow(dead_code)]
-    last_qp_delta_nonzero: bool,
+    pub(crate) last_qp_delta_nonzero: bool,
     // Slice header info for finalization
-    mmco_ops: Vec<(u32, u32)>,
-    long_term_reference_flag: bool,
-    is_intra_slice: bool,
+    pub(crate) mmco_ops: Vec<(u32, u32)>,
+    pub(crate) long_term_reference_flag: bool,
+    pub(crate) is_intra_slice: bool,
     // Deblock parameters (from first slice; per-slice deblock offsets
     // could differ but we use the first slice's values)
-    disable_deblocking_filter_idc: u32,
-    slice_alpha_c0_offset_div2: i32,
-    slice_beta_offset_div2: i32,
-    chroma_qp_index_offset: i32,
-    mb_width: u32,
-    mb_height: u32,
+    pub(crate) disable_deblocking_filter_idc: u32,
+    pub(crate) slice_alpha_c0_offset_div2: i32,
+    pub(crate) slice_beta_offset_div2: i32,
+    pub(crate) chroma_qp_index_offset: i32,
+    pub(crate) mb_width: u32,
+    pub(crate) mb_height: u32,
     /// Per-MB-pair field decoding flag (MBAFF only). Indexed by pair address.
-    mb_field_decoding: Vec<bool>,
+    pub(crate) mb_field_decoding: Vec<bool>,
     /// True if this picture uses MBAFF (mb_adaptive_frame_field_flag && !field_pic_flag).
-    mbaff_frame_flag: bool,
+    pub(crate) mbaff_frame_flag: bool,
     /// True if this picture is a field picture (field_pic_flag=1).
-    field_pic_flag: bool,
+    pub(crate) field_pic_flag: bool,
     /// True if this is the bottom field (only valid when field_pic_flag=true).
-    bottom_field_flag: bool,
+    pub(crate) bottom_field_flag: bool,
     /// Full frame height (needed for field picture output combining).
-    frame_height: u32,
+    pub(crate) frame_height: u32,
 }
 
 /// Streaming H.264 decoder.
@@ -135,7 +135,7 @@ struct PictureState {
 pub struct Decoder {
     sps_table: HashMap<u32, Sps>,
     pps_table: HashMap<u32, Pps>,
-    dpb: Dpb,
+    dpb: Dpb<Arc<DecodedPicture>>,
     /// In-progress picture being assembled from one or more slices.
     pending: Option<PictureState>,
     /// First field of a field-picture pair awaiting its complement for output.
@@ -347,7 +347,7 @@ impl Decoder {
             }
         }
 
-        let pic = Rc::new(DecodedPicture {
+        let pic = Arc::new(DecodedPicture {
             y: ps.frame.y.clone(),
             u: ps.frame.u.clone(),
             v: ps.frame.v.clone(),
@@ -499,17 +499,220 @@ impl Decoder {
     }
 
     fn decode_slice(&mut self, nal: &NalUnit) -> Result<(), DecodeError> {
-        let pps = self
-            .pps_table
+        let mut pending = self.pending.take();
+        let prepared = prepare_slice_job(
+            &self.sps_table,
+            &self.pps_table,
+            &mut self.dpb,
+            &mut pending,
+            nal,
+        );
+        let (job, ps) = match prepared {
+            Ok(v) => v,
+            Err(e) => {
+                // Match the original semantics: errors before the picture
+                // state was consumed leave the pending picture intact.
+                self.pending = pending;
+                return Err(e);
+            }
+        };
+        let ps = run_slice_job(&job, ps, &nal.rbsp)?;
+        self.pending = Some(ps);
+        Ok(())
+    }
+}
+
+/// Per-slice prepared data: everything the macroblock decode loop needs
+/// besides the picture state and the slice RBSP bytes. Generic over the
+/// picture-handle type so the threaded pipeline can prepare against a
+/// shadow DPB of planned pictures (see `threading`).
+pub(crate) struct SliceJobShell<P: crate::dpb::PicRef> {
+    pub(crate) nal_unit_type: NalUnitType,
+    pub(crate) nal_ref_idc: u8,
+    pub(crate) sps: Sps,
+    pub(crate) pps: Pps,
+    pub(crate) header: SliceHeader,
+    pub(crate) ref_pic_list: Vec<P>,
+    pub(crate) ref_pic_list_l0: Vec<P>,
+    pub(crate) ref_pic_list_l1: Vec<P>,
+    pub(crate) implicit_weights: Vec<Vec<i32>>,
+    pub(crate) use_weight: u8,
+    pub(crate) current_poc: i32,
+    pub(crate) slice_qp: i32,
+    pub(crate) is_continuation: bool,
+}
+
+/// A prepared slice with materialized (real) reference pictures.
+pub(crate) type SliceJob = SliceJobShell<Arc<DecodedPicture>>;
+
+/// Apply the in-loop deblocking filter to a finished picture state
+/// (frame-local: pixels plus per-MB metadata only).
+pub(crate) fn deblock_picture(ps: &mut PictureState) {
+    deblock::filter_frame_mbaff(
+        &mut ps.frame,
+        &ps.mb_info,
+        ps.mb_width as usize,
+        ps.disable_deblocking_filter_idc,
+        ps.slice_alpha_c0_offset_div2,
+        ps.slice_beta_offset_div2,
+        ps.chroma_qp_index_offset,
+        ps.mbaff_frame_flag,
+    );
+}
+
+/// Build the shared reference picture by moving the decoded planes out of
+/// the picture state (used by the threaded pipeline; the serial path
+/// clones instead because it keeps cropping the frame afterwards).
+pub(crate) fn take_decoded_picture(ps: &mut PictureState) -> Arc<DecodedPicture> {
+    Arc::new(DecodedPicture {
+        y: std::mem::take(&mut ps.frame.y),
+        u: std::mem::take(&mut ps.frame.u),
+        v: std::mem::take(&mut ps.frame.v),
+        width: ps.mb_width * 16,
+        height: (ps.frame.height.div_ceil(16)) * 16,
+        frame_num: ps.frame_num,
+        pic_order_cnt: ps.poc,
+        mv_l0: std::mem::take(&mut ps.mv_store_l0),
+        ref_idx_l0: std::mem::take(&mut ps.ref_idx_store_l0),
+        ref_poc_l0: std::mem::take(&mut ps.ref_poc_store_l0),
+        mv_l1: std::mem::take(&mut ps.mv_store_l1),
+        ref_idx_l1: std::mem::take(&mut ps.ref_idx_store_l1),
+        mb_width: ps.mb_width,
+        is_intra: ps.is_intra_slice,
+        structure: if ps.field_pic_flag {
+            if ps.bottom_field_flag {
+                crate::dpb::PictureStructure::BottomField
+            } else {
+                crate::dpb::PictureStructure::TopField
+            }
+        } else {
+            crate::dpb::PictureStructure::Frame
+        },
+    })
+}
+
+/// Crop a frame from coded (MB-aligned) dimensions to display dimensions,
+/// in place. `coded_w` is the coded luma width.
+pub(crate) fn crop_to_display(frame: &mut Frame, coded_w: usize) {
+    if coded_w == 0 {
+        return;
+    }
+    let coded_h = frame.y.len() / coded_w;
+    let display_w = frame.width as usize;
+    let display_h = frame.height as usize;
+    if coded_w == display_w && coded_h == display_h {
+        return;
+    }
+    if display_w > coded_w || display_h > coded_h || coded_w * coded_h > frame.y.len() {
+        return;
+    }
+    let mut y = vec![0u8; display_w * display_h];
+    for r in 0..display_h {
+        y[r * display_w..(r + 1) * display_w]
+            .copy_from_slice(&frame.y[r * coded_w..r * coded_w + display_w]);
+    }
+    let chroma_coded_w = coded_w / 2;
+    let chroma_w = display_w / 2;
+    let chroma_h = display_h / 2;
+    let mut u = vec![0u8; chroma_w * chroma_h];
+    let mut v = vec![0u8; chroma_w * chroma_h];
+    for r in 0..chroma_h {
+        u[r * chroma_w..(r + 1) * chroma_w]
+            .copy_from_slice(&frame.u[r * chroma_coded_w..r * chroma_coded_w + chroma_w]);
+        v[r * chroma_w..(r + 1) * chroma_w]
+            .copy_from_slice(&frame.v[r * chroma_coded_w..r * chroma_coded_w + chroma_w]);
+    }
+    frame.y = y;
+    frame.u = u;
+    frame.v = v;
+}
+
+/// Apply the per-picture DPB reference marking sequence: IDR clear,
+/// MMCO operations 1-5, insert, then MMCO 6 (spec 8.2.5.4). The picture
+/// handle is generic so the threaded pipeline can run the same sequence
+/// speculatively on planned pictures.
+pub(crate) fn apply_reference_marking<P: crate::dpb::PicRef>(
+    dpb: &mut Dpb<P>,
+    pic: P,
+    nal_unit_type: NalUnitType,
+    nal_ref_idc: u8,
+    frame_num: u32,
+    field_pic_flag: bool,
+    mmco_ops: &[(u32, u32)],
+    long_term_reference_flag: bool,
+) {
+    if nal_unit_type == NalUnitType::SliceIdr {
+        dpb.clear();
+    }
+    let reference = if nal_ref_idc > 0 {
+        if nal_unit_type == NalUnitType::SliceIdr && long_term_reference_flag {
+            ReferenceStatus::LongTerm(0)
+        } else {
+            ReferenceStatus::ShortTerm
+        }
+    } else {
+        ReferenceStatus::Unused
+    };
+    let mmco_curr_pic_num = if field_pic_flag {
+        (frame_num * 2 + 1) as i32
+    } else {
+        frame_num as i32
+    };
+    for &(op, param) in mmco_ops {
+        match op {
+            1 => {
+                let pic_num_to_remove = mmco_curr_pic_num - ((param & 0xFFFF) as i32 + 1);
+                dpb.mark_short_term_unused(pic_num_to_remove as u32);
+            }
+            2 => {
+                dpb.mark_long_term_unused(param);
+            }
+            3 => {
+                let abs_diff_minus1 = param & 0xFFFF;
+                let long_term_frame_idx = param >> 16;
+                let pic_num = mmco_curr_pic_num - (abs_diff_minus1 as i32 + 1);
+                dpb.assign_long_term(pic_num as u32, long_term_frame_idx);
+            }
+            4 => {
+                dpb.set_max_long_term_frame_idx(param);
+            }
+            5 => {
+                dpb.clear_all_refs();
+            }
+            6 => {
+                // Applied after insert below.
+            }
+            _ => {}
+        }
+    }
+    dpb.insert(pic, reference);
+    for &(op, param) in mmco_ops {
+        if op == 6 {
+            dpb.mark_current_as_long_term(param, frame_num);
+        }
+    }
+}
+
+/// Prepare one slice: parse the header, compute POC, build reference
+/// lists, and create (or take, for continuation slices) the picture state.
+/// Runs on the coordinator thread; touches only header-level state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_slice_job<P: crate::dpb::PicRef>(
+    sps_table: &HashMap<u32, Sps>,
+    pps_table: &HashMap<u32, Pps>,
+    dpb: &mut Dpb<P>,
+    pending: &mut Option<PictureState>,
+    nal: &NalUnit,
+) -> Result<(SliceJobShell<P>, PictureState), DecodeError> {
+        let pps = pps_table
             .values()
             .next()
             .ok_or(DecodeError::InvalidSyntax("no PPS available"))?;
-        let sps = self
-            .sps_table
+        let sps = sps_table
             .get(&pps.seq_parameter_set_id)
             .ok_or(DecodeError::InvalidSyntax("no SPS available"))?;
 
-        let (header, mut reader) =
+        let (header, _reader) =
             parse_slice_header(&nal.rbsp, sps, pps, nal.nal_unit_type, nal.nal_ref_idc)?;
 
         if header.slice_type != SliceType::I
@@ -523,8 +726,7 @@ impl Decoder {
         let is_b_slice = header.slice_type == SliceType::B;
 
         // Compute POC for current picture (needed for B-slice ref list construction)
-        let current_poc = self
-            .dpb
+        let current_poc = dpb
             .compute_poc(sps, &header, nal.nal_unit_type, nal.nal_ref_idc);
 
         // Build reference picture lists
@@ -541,8 +743,7 @@ impl Decoder {
             header.frame_num
         };
         let mut ref_pic_list = if is_p_slice {
-            let mut refs = self
-                .dpb
+            let mut refs = dpb
                 .short_term_ref_list(is_field_pic, header.bottom_field_flag);
             // Pad ref list if shorter than num_ref_idx_l0_active (spec 8.2.4.2.1:
             // if the list is shorter, duplicate the last entry to fill)
@@ -556,8 +757,7 @@ impl Decoder {
             vec![]
         };
         let mut _ref_pic_list_l0 = if is_b_slice {
-            let mut refs = self
-                .dpb
+            let mut refs = dpb
                 .ref_list_l0_b(current_poc, is_field_pic, header.bottom_field_flag);
             if !refs.is_empty() {
                 while refs.len() < header.num_ref_idx_l0_active as usize {
@@ -569,8 +769,7 @@ impl Decoder {
             vec![]
         };
         let mut _ref_pic_list_l1 = if is_b_slice {
-            let mut refs = self
-                .dpb
+            let mut refs = dpb
                 .ref_list_l1_b(current_poc, is_field_pic, header.bottom_field_flag);
             if !refs.is_empty() {
                 while refs.len() < header.num_ref_idx_l1_active as usize {
@@ -637,11 +836,11 @@ impl Decoder {
                     _ref_pic_list_l1
                         .iter()
                         .map(|ref_l1| {
-                            let td = (ref_l1.pic_order_cnt - ref_l0.pic_order_cnt).clamp(-128, 127);
+                            let td = (ref_l1.poc() - ref_l0.poc()).clamp(-128, 127);
                             if td == 0 {
                                 32
                             } else {
-                                let tb = (current_poc - ref_l0.pic_order_cnt).clamp(-128, 127);
+                                let tb = (current_poc - ref_l0.poc()).clamp(-128, 127);
                                 let tx = (16384 + (td.abs() / 2)) / td;
                                 let w1 = (tb * tx + 32) >> 8;
                                 if !(-64..=128).contains(&w1) {
@@ -658,11 +857,6 @@ impl Decoder {
             vec![]
         };
 
-        let wctx = WeightContext {
-            use_weight,
-            wt: header.weight_table.as_ref(),
-            implicit_weights: &implicit_weights,
-        };
 
         let width = sps.width();
         let frame_height = sps.height();
@@ -686,10 +880,10 @@ impl Decoder {
         // so per-MB data from earlier slices is visible for MV prediction,
         // CABAC neighbor contexts, and deblocking.
         let is_continuation = header.first_mb_in_slice > 0
-            && self.pending.is_some()
-            && self.pending.as_ref().unwrap().mb_slice_id.len() == total_mbs;
+            && pending.is_some()
+            && pending.as_ref().unwrap().mb_slice_id.len() == total_mbs;
         let ps = if is_continuation {
-            self.pending.take().unwrap()
+            pending.take().unwrap()
         } else {
             PictureState {
                 frame: Frame {
@@ -744,353 +938,414 @@ impl Decoder {
             }
         };
 
-        // Destructure into local variables so existing code works unchanged
-        let PictureState {
-            mut frame,
-            frame_num: _ps_frame_num,
-            poc: _ps_poc,
-            nal_unit_type: _ps_nal_type,
-            nal_ref_idc: _ps_nal_ref_idc,
-            mut nc_luma,
-            mut nc_cb,
-            mut nc_cr,
-            mut mv_store_l0,
-            mut mv_store_l1,
-            mut ref_idx_store_l0,
-            mut ref_poc_store_l0,
-            mut ref_idx_store_l1,
-            mut mvd_store,
-            mut mvd_store_l1,
-            mut mb_info,
-            mut i4x4_modes,
-            mut mb_cbp,
-            mut mb_chroma_pred,
-            mut mb_is_8x8dct,
-            mut mb_skip,
-            mut mb_is_direct,
-            mut blk_is_direct,
-            mut is_i16x16,
-            mut mb_slice_id,
-            mut current_slice_id,
-            prev_mb_qp: _,
-            last_qp_delta_nonzero: _,
-            mmco_ops: _ps_mmco_ops,
-            long_term_reference_flag: _ps_lt_ref_flag,
-            is_intra_slice: _ps_is_intra,
-            disable_deblocking_filter_idc: ps_deblock_idc,
-            slice_alpha_c0_offset_div2: ps_alpha,
-            slice_beta_offset_div2: ps_beta,
-            chroma_qp_index_offset: ps_chroma_qp_offset,
-            mb_width: _ps_mb_width,
-            mb_height: _ps_mb_height,
-            mb_field_decoding: mut _mb_field_decoding,
-            mbaff_frame_flag: _ps_mbaff,
-            field_pic_flag: _ps_field,
-            bottom_field_flag: _ps_bottom,
-            frame_height: _ps_frame_height,
-        } = ps;
 
-        // Increment slice ID for continuation slices so boundary checks work
-        if is_continuation {
-            current_slice_id += 1;
-        }
-        let this_slice_id = current_slice_id;
-
-        // Each slice reinitializes its own QP from the slice header
-        let mut prev_mb_qp = slice_qp;
-        let mut last_qp_delta_nonzero = false;
-
-        // CABAC or CAVLC?
-        let use_cabac = pps.entropy_coding_mode_flag;
-
-        // Initialize CABAC engine if needed
-        let cabac_byte_pos = if use_cabac {
-            let (pos, _data) = reader.cabac_start();
-            Some(pos)
-        } else {
-            None
-        };
-        // Create CabacReader from original RBSP data (avoids borrow conflict with reader)
-        let mut cabac_reader =
-            cabac_byte_pos.map(|pos| crate::cabac::CabacReader::new(&nal.rbsp, pos));
-        let mut cabac_state = if use_cabac {
-            crate::cabac::init_cabac_states(
-                slice_qp,
-                header.slice_type == SliceType::I,
-                header.cabac_init_idc,
-            )
-        } else {
-            [0u8; 1024]
-        };
-
-        let mut mb_skip_run: i32 = -1; // -1 = not initialized for P slices
-
-        let stride = coded_width as usize;
-        let mbaff = header.mbaff_frame_flag;
-        let mut mb_ly_stride = stride;
-        let mut mb_ly_offset = 0usize;
-        let mut mb_lc_stride = (coded_width / 2) as usize;
-        let mut mb_lc_offset = 0usize;
-
-        // Macro to construct a SliceContext from the local variables.
-        // Used at each call site that delegates to a SliceContext method.
-        macro_rules! make_ctx {
-            () => {
-                SliceContext {
-                    frame: &mut frame,
-                    stride,
-                    width: coded_width,
-                    height: coded_height,
-                    mb_width,
-                    nc_luma: &mut nc_luma,
-                    nc_cb: &mut nc_cb,
-                    nc_cr: &mut nc_cr,
-                    mv_store_l0: &mut mv_store_l0,
-                    mv_store_l1: &mut mv_store_l1,
-                    ref_idx_store_l0: &mut ref_idx_store_l0,
-                    ref_poc_store_l0: &mut ref_poc_store_l0,
-                    ref_idx_store_l1: &mut ref_idx_store_l1,
-                    mvd_store: &mut mvd_store,
-                    mvd_store_l1: &mut mvd_store_l1,
-                    mb_info: &mut mb_info,
-                    i4x4_modes: &mut i4x4_modes,
-                    mb_cbp: &mut mb_cbp,
-                    mb_chroma_pred: &mut mb_chroma_pred,
-                    mb_is_8x8dct: &mut mb_is_8x8dct,
-                    mb_skip: &mut mb_skip,
-                    mb_is_direct: &mut mb_is_direct,
-                    blk_is_direct: &mut blk_is_direct,
-                    is_i16x16: &mut is_i16x16,
-                    mb_slice_id: &mut mb_slice_id,
-                    this_slice_id,
-                    prev_mb_qp,
-                    last_qp_delta_nonzero,
-                    mbaff,
-                    mb_field_decoding: &mut _mb_field_decoding,
-                    ly_stride: mb_ly_stride,
-                    ly_offset: mb_ly_offset,
-                    lc_stride: mb_lc_stride,
-                    lc_offset: mb_lc_offset,
-                    field_pic_flag: is_field_pic,
-                    bottom_field_flag: header.bottom_field_flag,
-                }
-            };
-        }
-
-        let params = SliceParams {
-            is_p_slice,
-            is_b_slice,
-            use_weight,
+    Ok((
+        SliceJobShell {
+            nal_unit_type: nal.nal_unit_type,
+            nal_ref_idc: nal.nal_ref_idc,
+            sps: sps.clone(),
+            pps: pps.clone(),
+            header,
+            ref_pic_list,
+            ref_pic_list_l0: _ref_pic_list_l0,
+            ref_pic_list_l1: _ref_pic_list_l1,
+            implicit_weights,
+            use_weight: use_weight as u8,
             current_poc,
-            direct_spatial_mv_pred_flag: header.direct_spatial_mv_pred_flag,
-            direct_8x8_inference_flag: sps.direct_8x8_inference_flag,
-            transform_8x8_mode_flag: pps.transform_8x8_mode_flag,
-            scaling_list_4x4: &pps.scaling_list_4x4,
-            scaling_list_8x8: &pps.scaling_list_8x8,
-            constrained_intra_pred_flag: pps.constrained_intra_pred_flag,
-            chroma_qp_index_offset: pps.chroma_qp_index_offset,
-            ref_pic_list: &ref_pic_list,
-            ref_pic_list_l0: &_ref_pic_list_l0,
-            ref_pic_list_l1: &_ref_pic_list_l1,
-            num_ref_idx_l0_active: header.num_ref_idx_l0_active,
-            num_ref_idx_l1_active: header.num_ref_idx_l1_active,
-            wctx: &wctx,
-            first_mb_in_slice: header.first_mb_in_slice,
             slice_qp,
-            is_i_slice: header.slice_type == SliceType::I,
-            cabac_init_idc: header.cabac_init_idc,
-        };
+            is_continuation,
+        },
+        ps,
+    ))
+}
 
-        // In MBAFF, first_mb_in_slice is a pair address
-        let mut mb_idx = if mbaff {
-            (header.first_mb_in_slice as usize) * 2
-        } else {
-            header.first_mb_in_slice as usize
+/// Run the macroblock decode loop for one prepared slice against a
+/// picture state. Pure with respect to decoder-global state: everything
+/// comes from `job`, `ps`, and the RBSP bytes, so this is what worker
+/// threads execute in the threaded pipeline.
+pub(crate) fn run_slice_job(
+    job: &SliceJob,
+    ps: PictureState,
+    rbsp: &[u8],
+) -> Result<PictureState, DecodeError> {
+    let header = &job.header;
+    let sps = &job.sps;
+    let pps = &job.pps;
+    let ref_pic_list = &job.ref_pic_list;
+    let _ref_pic_list_l0 = &job.ref_pic_list_l0;
+    let _ref_pic_list_l1 = &job.ref_pic_list_l1;
+    let slice_qp = job.slice_qp;
+    let current_poc = job.current_poc;
+    let use_weight = job.use_weight;
+    let nal_unit_type = job.nal_unit_type;
+    let nal_ref_idc = job.nal_ref_idc;
+    let wctx = WeightContext {
+        use_weight: job.use_weight,
+        wt: job.header.weight_table.as_ref(),
+        implicit_weights: &job.implicit_weights,
+    };
+    let is_continuation = job.is_continuation;
+    let is_field_pic = header.field_pic_flag;
+    let is_p_slice = header.slice_type == SliceType::P;
+    let is_b_slice = header.slice_type == SliceType::B;
+
+    // Re-derive the CAVLC bitstream reader (positioned just past the slice
+    // header) and the geometry locals that prepare computed.
+    let (_, mut reader) = parse_slice_header(rbsp, sps, pps, job.nal_unit_type, job.nal_ref_idc)?;
+    let width = sps.width();
+    let frame_height = sps.height();
+    if width == 0 || frame_height == 0 || width > 16384 || frame_height > 16384 {
+        return Err(DecodeError::InvalidSyntax("SPS dimensions out of range"));
+    }
+    let height = if is_field_pic { frame_height / 2 } else { frame_height };
+    let mb_width = width.div_ceil(16);
+    let mb_height = height.div_ceil(16);
+    let coded_width = mb_width * 16;
+    let coded_height = mb_height * 16;
+    let total_mbs = (mb_width * mb_height) as usize;
+let PictureState {
+        mut frame,
+        frame_num: _ps_frame_num,
+        poc: _ps_poc,
+        nal_unit_type: _ps_nal_type,
+        nal_ref_idc: _ps_nal_ref_idc,
+        mut nc_luma,
+        mut nc_cb,
+        mut nc_cr,
+        mut mv_store_l0,
+        mut mv_store_l1,
+        mut ref_idx_store_l0,
+        mut ref_poc_store_l0,
+        mut ref_idx_store_l1,
+        mut mvd_store,
+        mut mvd_store_l1,
+        mut mb_info,
+        mut i4x4_modes,
+        mut mb_cbp,
+        mut mb_chroma_pred,
+        mut mb_is_8x8dct,
+        mut mb_skip,
+        mut mb_is_direct,
+        mut blk_is_direct,
+        mut is_i16x16,
+        mut mb_slice_id,
+        mut current_slice_id,
+        prev_mb_qp: _,
+        last_qp_delta_nonzero: _,
+        mmco_ops: _ps_mmco_ops,
+        long_term_reference_flag: _ps_lt_ref_flag,
+        is_intra_slice: _ps_is_intra,
+        disable_deblocking_filter_idc: ps_deblock_idc,
+        slice_alpha_c0_offset_div2: ps_alpha,
+        slice_beta_offset_div2: ps_beta,
+        chroma_qp_index_offset: ps_chroma_qp_offset,
+        mb_width: _ps_mb_width,
+        mb_height: _ps_mb_height,
+        mb_field_decoding: mut _mb_field_decoding,
+        mbaff_frame_flag: _ps_mbaff,
+        field_pic_flag: _ps_field,
+        bottom_field_flag: _ps_bottom,
+        frame_height: _ps_frame_height,
+    } = ps;
+
+    // Increment slice ID for continuation slices so boundary checks work
+    if is_continuation {
+        current_slice_id += 1;
+    }
+    let this_slice_id = current_slice_id;
+
+    // Each slice reinitializes its own QP from the slice header
+    let mut prev_mb_qp = slice_qp;
+    let mut last_qp_delta_nonzero = false;
+
+    // CABAC or CAVLC?
+    let use_cabac = pps.entropy_coding_mode_flag;
+
+    // Initialize CABAC engine if needed
+    let cabac_byte_pos = if use_cabac {
+        let (pos, _data) = reader.cabac_start();
+        Some(pos)
+    } else {
+        None
+    };
+    // Create CabacReader from original RBSP data (avoids borrow conflict with reader)
+    let mut cabac_reader =
+        cabac_byte_pos.map(|pos| crate::cabac::CabacReader::new(rbsp, pos));
+    let mut cabac_state = if use_cabac {
+        crate::cabac::init_cabac_states(
+            slice_qp,
+            header.slice_type == SliceType::I,
+            header.cabac_init_idc,
+        )
+    } else {
+        [0u8; 1024]
+    };
+
+    let mut mb_skip_run: i32 = -1; // -1 = not initialized for P slices
+
+    let stride = coded_width as usize;
+    let mbaff = header.mbaff_frame_flag;
+    let mut mb_ly_stride = stride;
+    let mut mb_ly_offset = 0usize;
+    let mut mb_lc_stride = (coded_width / 2) as usize;
+    let mut mb_lc_offset = 0usize;
+
+    // Macro to construct a SliceContext from the local variables.
+    // Used at each call site that delegates to a SliceContext method.
+    macro_rules! make_ctx {
+        () => {
+            SliceContext {
+                frame: &mut frame,
+                stride,
+                width: coded_width,
+                height: coded_height,
+                mb_width,
+                nc_luma: &mut nc_luma,
+                nc_cb: &mut nc_cb,
+                nc_cr: &mut nc_cr,
+                mv_store_l0: &mut mv_store_l0,
+                mv_store_l1: &mut mv_store_l1,
+                ref_idx_store_l0: &mut ref_idx_store_l0,
+                ref_poc_store_l0: &mut ref_poc_store_l0,
+                ref_idx_store_l1: &mut ref_idx_store_l1,
+                mvd_store: &mut mvd_store,
+                mvd_store_l1: &mut mvd_store_l1,
+                mb_info: &mut mb_info,
+                i4x4_modes: &mut i4x4_modes,
+                mb_cbp: &mut mb_cbp,
+                mb_chroma_pred: &mut mb_chroma_pred,
+                mb_is_8x8dct: &mut mb_is_8x8dct,
+                mb_skip: &mut mb_skip,
+                mb_is_direct: &mut mb_is_direct,
+                blk_is_direct: &mut blk_is_direct,
+                is_i16x16: &mut is_i16x16,
+                mb_slice_id: &mut mb_slice_id,
+                this_slice_id,
+                prev_mb_qp,
+                last_qp_delta_nonzero,
+                mbaff,
+                mb_field_decoding: &mut _mb_field_decoding,
+                ly_stride: mb_ly_stride,
+                ly_offset: mb_ly_offset,
+                lc_stride: mb_lc_stride,
+                lc_offset: mb_lc_offset,
+                field_pic_flag: is_field_pic,
+                bottom_field_flag: header.bottom_field_flag,
+            }
         };
-        if mb_idx >= total_mbs {
-            return Err(DecodeError::InvalidSyntax("first_mb_in_slice out of range"));
+    }
+
+    let params = SliceParams {
+        is_p_slice,
+        is_b_slice,
+        use_weight,
+        current_poc,
+        direct_spatial_mv_pred_flag: header.direct_spatial_mv_pred_flag,
+        direct_8x8_inference_flag: sps.direct_8x8_inference_flag,
+        transform_8x8_mode_flag: pps.transform_8x8_mode_flag,
+        scaling_list_4x4: &pps.scaling_list_4x4,
+        scaling_list_8x8: &pps.scaling_list_8x8,
+        constrained_intra_pred_flag: pps.constrained_intra_pred_flag,
+        chroma_qp_index_offset: pps.chroma_qp_index_offset,
+        ref_pic_list: &ref_pic_list,
+        ref_pic_list_l0: &_ref_pic_list_l0,
+        ref_pic_list_l1: &_ref_pic_list_l1,
+        num_ref_idx_l0_active: header.num_ref_idx_l0_active,
+        num_ref_idx_l1_active: header.num_ref_idx_l1_active,
+        wctx: &wctx,
+        first_mb_in_slice: header.first_mb_in_slice,
+        slice_qp,
+        is_i_slice: header.slice_type == SliceType::I,
+        cabac_init_idc: header.cabac_init_idc,
+    };
+
+    // In MBAFF, first_mb_in_slice is a pair address
+    let mut mb_idx = if mbaff {
+        (header.first_mb_in_slice as usize) * 2
+    } else {
+        header.first_mb_in_slice as usize
+    };
+    if mb_idx >= total_mbs {
+        return Err(DecodeError::InvalidSyntax("first_mb_in_slice out of range"));
+    }
+    while mb_idx < total_mbs {
+        // CAVLC end-of-slice: check before reading any new syntax elements.
+        // Skip this check when counting down a skip run (no reads needed).
+        if !use_cabac && mb_skip_run <= 0 && !reader.more_rbsp_data() {
+            break;
         }
-        while mb_idx < total_mbs {
-            // CAVLC end-of-slice: check before reading any new syntax elements.
-            // Skip this check when counting down a skip run (no reads needed).
-            if !use_cabac && mb_skip_run <= 0 && !reader.more_rbsp_data() {
-                break;
-            }
 
-            // Stamp this MB with the current slice ID for boundary detection
-            mb_slice_id[mb_idx] = this_slice_id;
-            // Compute pixel position
-            let (mb_x, mb_y) = if mbaff {
-                let pair_addr = mb_idx / 2;
-                let pair_col = pair_addr % mb_width as usize;
-                let pair_row = pair_addr / mb_width as usize;
-                let x = pair_col * 16;
-                let y = pair_row * 32 + (mb_idx % 2) * 16;
-                (x, y)
-            } else {
-                (
-                    (mb_idx % mb_width as usize) * 16,
-                    (mb_idx / mb_width as usize) * 16,
-                )
-            };
+        // Stamp this MB with the current slice ID for boundary detection
+        mb_slice_id[mb_idx] = this_slice_id;
+        // Compute pixel position
+        let (mb_x, mb_y) = if mbaff {
+            let pair_addr = mb_idx / 2;
+            let pair_col = pair_addr % mb_width as usize;
+            let pair_row = pair_addr / mb_width as usize;
+            let x = pair_col * 16;
+            let y = pair_row * 32 + (mb_idx % 2) * 16;
+            (x, y)
+        } else {
+            (
+                (mb_idx % mb_width as usize) * 16,
+                (mb_idx / mb_width as usize) * 16,
+            )
+        };
 
-            // CABAC decode path
-            if use_cabac {
-                let cr = cabac_reader.as_mut().unwrap();
-                let st = &mut cabac_state;
+        // CABAC decode path
+        if use_cabac {
+            let cr = cabac_reader.as_mut().unwrap();
+            let st = &mut cabac_state;
 
-                // MBAFF: end_of_slice_flag and mb_field_decoding_flag are both
-                // handled inside decode_cabac_mb (contexts 70-72 for field flag,
-                // with MBAFF-adjusted first_mb comparison for terminate).
-                {
-                    let mut ctx = make_ctx!();
-                    match ctx.decode_cabac_mb(cr, st, &nal.rbsp, mb_idx, mb_x, mb_y, &params)? {
-                        CabacMbResult::EndOfSlice => break,
-                        CabacMbResult::Decoded => {}
-                    }
-                    prev_mb_qp = ctx.prev_mb_qp;
-                    last_qp_delta_nonzero = ctx.last_qp_delta_nonzero;
-                }
-                if mbaff && mb_idx % 2 != 0 {
-                    let term = cr.get_cabac_terminate();
-                    if term != 0 {
-                        mb_idx += 1;
-                        break;
-                    }
-                }
-
-                mb_idx += 1;
-                continue;
-            }
-
-            // P/B-slice skip run handling
-            if is_p_slice || is_b_slice {
-                if mb_skip_run < 0 {
-                    mb_skip_run = reader.read_ue()? as i32;
-                }
-                if mb_skip_run > 0 {
-                    mb_skip_run -= 1;
-                    mb_skip[mb_idx] = true; // Mark as skipped for MBAFF field flag inference
-                                            // Set layout for skip MBs (field_flag already known)
-                    {
-                        let mut ctx = make_ctx!();
-                        ctx.set_mb_layout(mb_idx, mb_x, mb_y);
-                        mb_ly_stride = ctx.ly_stride;
-                        mb_ly_offset = ctx.ly_offset;
-                        mb_lc_stride = ctx.lc_stride;
-                        mb_lc_offset = ctx.lc_offset;
-                    }
-                    if is_p_slice {
-                        // P_Skip: MV = median predictor, ref_idx = 0, no residual
-                        make_ctx!().decode_p_skip_mb(mb_idx, mb_x, mb_y, &params);
-                    } else {
-                        // B_Skip: spatial/temporal direct MV + MC, no residual
-                        make_ctx!().decode_b_skip_mb(mb_idx, mb_x, mb_y, &params);
-                    }
-                    mb_info[mb_idx] = MbInfo {
-                        mb_type: MbType::Inter,
-                        qp_y: prev_mb_qp,
-                        ..Default::default()
-                    };
-                    mb_idx += 1;
-                    continue;
-                }
-                // mb_skip_run == 0: parse the next MB normally
-                mb_skip_run = -1; // reset for next iteration
-
-                // MBAFF: read mb_field_decoding_flag for this pair
-                // (spec 7.3.4: read before first non-skipped MB of pair)
-                if mbaff {
-                    let is_top = mb_idx % 2 == 0;
-                    let top_was_skipped = !is_top && mb_skip[mb_idx - 1];
-                    if is_top || top_was_skipped {
-                        _mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
-                    }
-                }
-            }
-
-            // MBAFF I-slice: read mb_field_decoding_flag before MB decode
-            if mbaff && !(is_p_slice || is_b_slice) {
-                let is_top = mb_idx % 2 == 0;
-                if is_top {
-                    _mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
-                }
-            }
-
+            // MBAFF: end_of_slice_flag and mb_field_decoding_flag are both
+            // handled inside decode_cabac_mb (contexts 70-72 for field flag,
+            // with MBAFF-adjusted first_mb comparison for terminate).
             {
                 let mut ctx = make_ctx!();
-                ctx.set_mb_layout(mb_idx, mb_x, mb_y);
-                ctx.decode_cavlc_mb(&mut reader, mb_idx, mb_x, mb_y, &params)?;
+                match ctx.decode_cabac_mb(cr, st, rbsp, mb_idx, mb_x, mb_y, &params)? {
+                    CabacMbResult::EndOfSlice => break,
+                    CabacMbResult::Decoded => {}
+                }
                 prev_mb_qp = ctx.prev_mb_qp;
                 last_qp_delta_nonzero = ctx.last_qp_delta_nonzero;
             }
-            mb_idx += 1;
+            if mbaff && mb_idx % 2 != 0 {
+                let term = cr.get_cabac_terminate();
+                if term != 0 {
+                    mb_idx += 1;
+                    break;
+                }
+            }
 
-            // CAVLC end-of-slice: spec says "while (more_rbsp_data())"
-            // after each MB. For single-slice, this naturally ends at
-            // total_mbs. For multi-slice, it stops at each slice boundary.
-            if !use_cabac && !reader.more_rbsp_data() {
-                break;
+            mb_idx += 1;
+            continue;
+        }
+
+        // P/B-slice skip run handling
+        if is_p_slice || is_b_slice {
+            if mb_skip_run < 0 {
+                mb_skip_run = reader.read_ue()? as i32;
+            }
+            if mb_skip_run > 0 {
+                mb_skip_run -= 1;
+                mb_skip[mb_idx] = true; // Mark as skipped for MBAFF field flag inference
+                                        // Set layout for skip MBs (field_flag already known)
+                {
+                    let mut ctx = make_ctx!();
+                    ctx.set_mb_layout(mb_idx, mb_x, mb_y);
+                    mb_ly_stride = ctx.ly_stride;
+                    mb_ly_offset = ctx.ly_offset;
+                    mb_lc_stride = ctx.lc_stride;
+                    mb_lc_offset = ctx.lc_offset;
+                }
+                if is_p_slice {
+                    // P_Skip: MV = median predictor, ref_idx = 0, no residual
+                    make_ctx!().decode_p_skip_mb(mb_idx, mb_x, mb_y, &params);
+                } else {
+                    // B_Skip: spatial/temporal direct MV + MC, no residual
+                    make_ctx!().decode_b_skip_mb(mb_idx, mb_x, mb_y, &params);
+                }
+                mb_info[mb_idx] = MbInfo {
+                    mb_type: MbType::Inter,
+                    qp_y: prev_mb_qp,
+                    ..Default::default()
+                };
+                mb_idx += 1;
+                continue;
+            }
+            // mb_skip_run == 0: parse the next MB normally
+            mb_skip_run = -1; // reset for next iteration
+
+            // MBAFF: read mb_field_decoding_flag for this pair
+            // (spec 7.3.4: read before first non-skipped MB of pair)
+            if mbaff {
+                let is_top = mb_idx % 2 == 0;
+                let top_was_skipped = !is_top && mb_skip[mb_idx - 1];
+                if is_top || top_was_skipped {
+                    _mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
+                }
             }
         }
 
-        // Post-loop: fill deblock info and ref POC table
-        let first_mb = if mbaff {
-            (header.first_mb_in_slice as usize) * 2
-        } else {
-            header.first_mb_in_slice as usize
-        };
-        make_ctx!().finalize_mb_info(first_mb, mb_idx.min(total_mbs), &params);
+        // MBAFF I-slice: read mb_field_decoding_flag before MB decode
+        if mbaff && !(is_p_slice || is_b_slice) {
+            let is_top = mb_idx % 2 == 0;
+            if is_top {
+                _mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
+            }
+        }
 
-        // Store state back into pending PictureState.
-        // Deblocking and DPB insertion happen in finalize_pending().
-        self.pending = Some(PictureState {
-            frame,
-            frame_num: header.frame_num,
-            poc: current_poc,
-            nal_unit_type: nal.nal_unit_type,
-            nal_ref_idc: nal.nal_ref_idc,
-            nc_luma,
-            nc_cb,
-            nc_cr,
-            mv_store_l0,
-            mv_store_l1,
-            ref_idx_store_l0,
-            ref_poc_store_l0,
-            ref_idx_store_l1,
-            mvd_store,
-            mvd_store_l1,
-            mb_info,
-            i4x4_modes,
-            mb_cbp,
-            mb_chroma_pred,
-            mb_is_8x8dct,
-            mb_skip,
-            mb_is_direct,
-            blk_is_direct,
-            is_i16x16,
-            mb_slice_id,
-            current_slice_id,
-            prev_mb_qp,
-            last_qp_delta_nonzero,
-            mmco_ops: header.mmco_ops.clone(),
-            long_term_reference_flag: header.long_term_reference_flag,
-            is_intra_slice: header.slice_type == SliceType::I,
-            disable_deblocking_filter_idc: ps_deblock_idc,
-            slice_alpha_c0_offset_div2: ps_alpha,
-            slice_beta_offset_div2: ps_beta,
-            chroma_qp_index_offset: ps_chroma_qp_offset,
-            mb_width,
-            mb_height,
-            mb_field_decoding: _mb_field_decoding,
-            mbaff_frame_flag: header.mbaff_frame_flag,
-                field_pic_flag: header.field_pic_flag,
-                bottom_field_flag: header.bottom_field_flag,
-                frame_height,
-        });
+        {
+            let mut ctx = make_ctx!();
+            ctx.set_mb_layout(mb_idx, mb_x, mb_y);
+            ctx.decode_cavlc_mb(&mut reader, mb_idx, mb_x, mb_y, &params)?;
+            prev_mb_qp = ctx.prev_mb_qp;
+            last_qp_delta_nonzero = ctx.last_qp_delta_nonzero;
+        }
+        mb_idx += 1;
 
-        Ok(())
+        // CAVLC end-of-slice: spec says "while (more_rbsp_data())"
+        // after each MB. For single-slice, this naturally ends at
+        // total_mbs. For multi-slice, it stops at each slice boundary.
+        if !use_cabac && !reader.more_rbsp_data() {
+            break;
+        }
     }
+
+    // Post-loop: fill deblock info and ref POC table
+    let first_mb = if mbaff {
+        (header.first_mb_in_slice as usize) * 2
+    } else {
+        header.first_mb_in_slice as usize
+    };
+    make_ctx!().finalize_mb_info(first_mb, mb_idx.min(total_mbs), &params);
+
+    // Rebuild the picture state for the caller. Deblocking and DPB
+    // insertion happen in finalize_pending() / the threaded commit.
+    Ok(PictureState {
+        frame,
+        frame_num: header.frame_num,
+        poc: current_poc,
+        nal_unit_type,
+        nal_ref_idc,
+        nc_luma,
+        nc_cb,
+        nc_cr,
+        mv_store_l0,
+        mv_store_l1,
+        ref_idx_store_l0,
+        ref_poc_store_l0,
+        ref_idx_store_l1,
+        mvd_store,
+        mvd_store_l1,
+        mb_info,
+        i4x4_modes,
+        mb_cbp,
+        mb_chroma_pred,
+        mb_is_8x8dct,
+        mb_skip,
+        mb_is_direct,
+        blk_is_direct,
+        is_i16x16,
+        mb_slice_id,
+        current_slice_id,
+        prev_mb_qp,
+        last_qp_delta_nonzero,
+        mmco_ops: header.mmco_ops.clone(),
+        long_term_reference_flag: header.long_term_reference_flag,
+        is_intra_slice: header.slice_type == SliceType::I,
+        disable_deblocking_filter_idc: ps_deblock_idc,
+        slice_alpha_c0_offset_div2: ps_alpha,
+        slice_beta_offset_div2: ps_beta,
+        chroma_qp_index_offset: ps_chroma_qp_offset,
+        mb_width,
+        mb_height,
+        mb_field_decoding: _mb_field_decoding,
+        mbaff_frame_flag: header.mbaff_frame_flag,
+        field_pic_flag: header.field_pic_flag,
+        bottom_field_flag: header.bottom_field_flag,
+        frame_height,
+    })
 }
 
 /// H.264 decoder with built-in display-order reordering.
