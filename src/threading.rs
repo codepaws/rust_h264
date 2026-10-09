@@ -29,7 +29,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 
 use crate::decoder::{
@@ -83,6 +83,23 @@ struct OpenPicture {
     slot: SharedSlot,
 }
 
+/// One picture-decode task for the worker pool.
+struct PoolTask {
+    seq: u64,
+    slices: Vec<ThreadSlice>,
+    ps: PictureState,
+    shared: Arc<DecodedPicture>,
+}
+
+/// Shared worker-pool state: a task queue with shutdown flag. Workers park
+/// on the condvar when the queue is empty and exit once shutdown is set
+/// and the queue is drained.
+struct Pool {
+    queue: Mutex<VecDeque<PoolTask>>,
+    cv: Condvar,
+    shutdown: Mutex<bool>,
+}
+
 /// H.264 decoder that pipelines pictures across worker threads and emits
 /// frames in display order — the threaded counterpart of
 /// [`OrderedDecoder`](crate::decoder::OrderedDecoder).
@@ -121,7 +138,13 @@ pub struct ThreadedDecoder {
     slots: HashMap<u64, u32>,
     /// Slot identity -> seq, to compute a picture's commit dependencies.
     slot_seqs: HashMap<usize, u64>,
-    inflight: VecDeque<JoinHandle<()>>,
+    /// Worker pool (created lazily on the first dispatched picture).
+    pool: Option<Arc<Pool>>,
+    worker_handles: Vec<JoinHandle<()>>,
+    /// Pictures scheduled but whose results have not been received yet
+    /// (running or queued in the pool). Bounds the pipeline like the old
+    /// in-flight handle count did.
+    unfinished: usize,
     completed: BTreeMap<u64, Result<Frame, DecodeError>>,
     done_rx: Receiver<(u64, Result<Frame, DecodeError>)>,
     done_tx: Sender<(u64, Result<Frame, DecodeError>)>,
@@ -149,7 +172,9 @@ impl ThreadedDecoder {
             commit_next: 0,
             slots: HashMap::new(),
             slot_seqs: HashMap::new(),
-            inflight: VecDeque::new(),
+            pool: None,
+            worker_handles: Vec::new(),
+            unfinished: 0,
             completed: BTreeMap::new(),
             done_rx,
             done_tx,
@@ -215,7 +240,7 @@ impl ThreadedDecoder {
                     // whatever has finished.
                     self.close_open_picture()?;
                     self.pump(&mut out);
-                    while self.inflight.len() >= self.threads {
+                    while self.unfinished >= self.threads {
                         self.wait_one_completion();
                         self.pump(&mut out);
                     }
@@ -289,11 +314,11 @@ impl ThreadedDecoder {
         let _ = self.close_open_picture();
         let mut out = Vec::new();
         self.pump(&mut out);
-        // Join workers in coded order, pumping between joins: a worker may
-        // be waiting on the commit barrier, and commits happen in pump().
-        while !self.inflight.is_empty() {
-            let handle = self.inflight.pop_front().unwrap();
-            let _ = handle.join();
+        // Receive every outstanding result (workers may still be running;
+        // pumping between receives commits in coded order). Workers
+        // themselves stay pooled for reuse until the decoder is dropped.
+        while self.unfinished > 0 {
+            self.wait_one_completion();
             self.pump(&mut out);
         }
         if self.first_error.is_some() {
@@ -365,13 +390,33 @@ impl ThreadedDecoder {
         });
         let _ = open.slot.set(Arc::clone(&pic));
 
-        let done_tx = self.done_tx.clone();
-        let seq = open.seq;
-        let handle = std::thread::spawn(move || {
-            let result = run_picture(&slices, ps, &pic);
-            let _ = done_tx.send((seq, result));
+        // Lazily create the worker pool on first use, then queue the task.
+        let pool = self.pool.get_or_insert_with(|| {
+            let pool = Arc::new(Pool {
+                queue: Mutex::new(VecDeque::new()),
+                cv: Condvar::new(),
+                shutdown: Mutex::new(false),
+            });
+            let mut handles = Vec::with_capacity(self.threads);
+            for _ in 0..self.threads {
+                let pool = Arc::clone(&pool);
+                let done_tx = self.done_tx.clone();
+                handles.push(std::thread::spawn(move || pool_worker(pool, done_tx)));
+            }
+            self.worker_handles = handles;
+            pool
         });
-        self.inflight.push_back(handle);
+        {
+            let mut q = pool.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.push_back(PoolTask {
+                seq: open.seq,
+                slices,
+                ps,
+                shared: Arc::clone(&pic),
+            });
+        }
+        self.unfinished += 1;
+        pool.cv.notify_one();
         Ok(())
     }
 
@@ -379,11 +424,9 @@ impl ThreadedDecoder {
     /// pictures in order as possible, emitting display-ready frames.
     fn pump(&mut self, out: &mut Vec<Frame>) {
         while let Ok((seq, res)) = self.done_rx.try_recv() {
+            self.unfinished = self.unfinished.saturating_sub(1);
             self.completed.insert(seq, res);
         }
-        // Drop finished worker handles so the in-flight bound reflects
-        // actually-running workers (their results are already queued).
-        self.inflight.retain(|h| !h.is_finished());
         while self.commit_next < self.next_seq {
             let seq = self.commit_next;
             let Some(res) = self.completed.remove(&seq) else {
@@ -413,22 +456,16 @@ impl ThreadedDecoder {
     }
 
     /// Block until a worker result arrives (or a short timeout passes).
-    ///
-    /// The timeout is required: a worker may have sent its result — already
-    /// drained by an earlier `pump` — while its handle still reads as
-    /// unfinished, leaving nothing for `recv` to wait for. On timeout the
-    /// caller's `pump` re-checks handle state and commits.
     fn wait_one_completion(&mut self) {
         match self.done_rx.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok((seq, res)) => {
+                self.unfinished = self.unfinished.saturating_sub(1);
                 self.completed.insert(seq, res);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                // A worker panicked; join to surface it.
-                while let Some(handle) = self.inflight.pop_front() {
-                    let _ = handle.join();
-                }
+                // Cannot happen while `self.done_tx` exists; a panicking
+                // worker is contained by the pool's catch_unwind.
             }
         }
     }
@@ -677,6 +714,57 @@ fn materialize(shell: &SliceJobShell<PlannedPic>) -> SliceJob {
         current_poc: shell.current_poc,
         slice_qp: shell.slice_qp,
         is_continuation: shell.is_continuation,
+    }
+}
+
+/// Pool worker loop: park on the queue condvar, run tasks, send results.
+/// A panicking task is caught and reported as an error (with the shared
+/// picture marked complete so row-waiters do not spin forever).
+fn pool_worker(pool: Arc<Pool>, done_tx: Sender<(u64, Result<Frame, DecodeError>)>) {
+    loop {
+        let task = {
+            let mut q = pool.queue.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(task) = q.pop_front() {
+                    break task;
+                }
+                if *pool.shutdown.lock().unwrap_or_else(|e| e.into_inner()) {
+                    return;
+                }
+                q = pool.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        let PoolTask { seq, slices, ps, shared: pic } = task;
+        let guard = Arc::clone(&pic);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_picture(&slices, ps, &pic)
+        }))
+        .unwrap_or_else(|_| {
+            guard
+                .row_progress
+                .store(usize::MAX, std::sync::atomic::Ordering::Release);
+            Err(DecodeError::InvalidSyntax("decode worker panicked"))
+        });
+        let _ = done_tx.send((seq, result));
+    }
+}
+
+impl Drop for ThreadedDecoder {
+    fn drop(&mut self) {
+        if let Some(pool) = self.pool.take() {
+            {
+                let mut q = pool.queue.lock().unwrap_or_else(|e| e.into_inner());
+                q.clear();
+            }
+            {
+                let mut flag = pool.shutdown.lock().unwrap_or_else(|e| e.into_inner());
+                *flag = true;
+            }
+            pool.cv.notify_all();
+        }
+        for h in self.worker_handles.drain(..) {
+            let _ = h.join();
+        }
     }
 }
 
