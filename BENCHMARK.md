@@ -481,6 +481,13 @@ their references (same machine, deblocking enabled, best of 3):
   instead of y_int.
 - Field pictures still require the serial Decoder; the worker-pool
   follow-up (replacing spawn-per-picture) remains open.
+- **Worker pool** (persistent workers + task queue replacing one thread
+  spawn per picture; 3 interleaved rounds, averaged): **+6.7% at 4
+  threads / +2.1% at 8 threads on 720p B-frames, +7.7% / +2.0% on
+  720p P-only** — thread spawn/teardown is a fixed per-picture tax, so
+  the pool matters most exactly where flux will live (few threads,
+  busy host CPU). At 4 threads the P-only stream now sustains
+  **777 fps**, ~3.3x its single-thread rate.
 
 ## FFmpeg byte-exactness on real content
 
