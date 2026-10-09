@@ -108,6 +108,19 @@ pub fn set_force_scalar(force: bool) {
     let _ = force;
 }
 
+/// Nanoseconds spent inside the deblocking filter so far this process —
+/// for profiling the filter's share of decode time (see `bench_decode`).
+pub fn deblock_ns() -> u64 {
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        0
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        deblock::DEBLOCK_NS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[cfg(feature = "dev-internals")]
 #[allow(dead_code)]
 pub mod sps;

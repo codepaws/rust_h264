@@ -412,6 +412,23 @@ P-only case remains slower than 1 thread.)
   kernels like FFmpeg's rather than generic vectorization; the
   row-granular in-loop deblock (below) also changed the integration
   calculus.
+- **Measured deblock share of single-threaded decode** (direct timing,
+  `bench_decode` now prints it): **12.0% at 1080p B, 14.5% at 720p B,
+  18.1% at 720p P-only** (deblocking enabled). A perfect 2x filter
+  therefore buys only ~6-9% single-threaded — below the threshold where
+  further deblock SIMD work pays off. The earlier SIMD attempts' parity
+  is consistent with this: the filter math was never the dominant cost;
+  per-call dispatch of `#[target_feature]` kernels and per-segment bS
+  derivation dominated. Decision: stop here. If deblock SIMD is ever
+  revisited, the design checklist is: profile first, compile the whole
+  MB-row deblock loop as one `#[target_feature]` function chosen once
+  per frame (not per-call kernels), vectorize bS derivation and skip
+  all-zero edges before any table lookups, split kernels per edge type
+  (internal edges can never see bS=4), transpose once per MB rather
+  than per edge, batch chroma U+V into one vector, then AVX2. The
+  remaining single-thread gap to FFmpeg (~4-5x) lives in motion
+  compensation dispatch overhead, intra prediction, the inverse
+  transform, and entropy decode — in that order.
 - **FFmpeg single-threaded is 2.6-3.4x faster than our best threaded
   result on this machine** — the x86 gap is larger than the 2.6-4x
   single-threaded gap on the original author's Mac. The remaining gap

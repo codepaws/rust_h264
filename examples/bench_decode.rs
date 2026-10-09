@@ -99,4 +99,14 @@ fn main() {
         "threads: {threads}{}",
         if scalar { " (scalar forced)" } else { "" }
     );
+    // Deblock share of the best pass (accumulated across all passes, so
+    // divide by iteration count; warmup adds one more).
+    let db_ns = rust_h264::deblock_ns() as f64 / (iterations + 1) as f64;
+    let total_ns = best as f64 * 1000.0;
+    eprintln!(
+        "deblock share: {:.1}% ({:.0} us/frame of {:.0} us/frame)",
+        100.0 * db_ns / total_ns,
+        db_ns / 1000.0,
+        total_ns / 1000.0,
+    );
 }

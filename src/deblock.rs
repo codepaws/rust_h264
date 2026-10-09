@@ -4,6 +4,10 @@
 //! order, vertical edges are filtered left-to-right, then horizontal edges
 //! top-to-bottom. Each edge consists of 4-sample segments filtered independently.
 
+/// Nanoseconds spent inside the deblocking filter (row calls + whole-frame
+/// pass), for profiling the filter's share of decode time.
+pub static DEBLOCK_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 use crate::decoder::Frame;
 use crate::residual::chroma_qp;
 use crate::slice::SliceHeader;
@@ -156,6 +160,7 @@ fn filter_frame_inner(
         return;
     }
 
+    let t0 = std::time::Instant::now();
     let filter_offset_a = slice_alpha_c0_offset_div2.wrapping_mul(2);
     let filter_offset_b = slice_beta_offset_div2.wrapping_mul(2);
     // 4x4 block index layout within an MB (raster scan):
@@ -178,6 +183,7 @@ fn filter_frame_inner(
             chroma_qp_index_offset,
         );
     }
+    DEBLOCK_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Deblock one macroblock's vertical and horizontal edges (progressive or
@@ -493,6 +499,7 @@ pub(crate) fn deblock_mb_range(
     if disable_deblocking_filter_idc == 1 {
         return;
     }
+    let t0 = std::time::Instant::now();
     for mb_idx in first_mb..end_mb.min(mb_info.len()) {
         filter_mb(
             frame,
@@ -505,6 +512,7 @@ pub(crate) fn deblock_mb_range(
             chroma_qp_index_offset,
         );
     }
+    DEBLOCK_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Convert (column, row) in 4x4-block units to raster-scan 4x4 block index.
