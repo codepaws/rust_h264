@@ -101,6 +101,11 @@ pub(crate) struct PictureState {
     pub(crate) bottom_field_flag: bool,
     /// Full frame height (needed for field picture output combining).
     pub(crate) frame_height: u32,
+    /// MB rows already deblocked in-loop (progressive pictures). Rows are
+    /// deblocked as the decode loop completes them; the remainder is
+    /// deblocked at finalize time. MBAFF/field pictures keep 0 and use the
+    /// whole-frame pass.
+    pub(crate) deblocked_rows: usize,
 }
 
 /// Streaming H.264 decoder.
@@ -284,16 +289,7 @@ impl Decoder {
         let mut ps = self.pending.take()?;
 
         // Apply deblocking filter
-        deblock::filter_frame_mbaff(
-            &mut ps.frame,
-            &ps.mb_info,
-            ps.mb_width as usize,
-            ps.disable_deblocking_filter_idc,
-            ps.slice_alpha_c0_offset_div2,
-            ps.slice_beta_offset_div2,
-            ps.chroma_qp_index_offset,
-            ps.mbaff_frame_flag,
-        );
+        deblock_picture(&mut ps);
 
         if ps.nal_unit_type == NalUnitType::SliceIdr {
             self.dpb.clear();
@@ -548,16 +544,30 @@ pub(crate) type SliceJob = SliceJobShell<Arc<DecodedPicture>>;
 /// Apply the in-loop deblocking filter to a finished picture state
 /// (frame-local: pixels plus per-MB metadata only).
 pub(crate) fn deblock_picture(ps: &mut PictureState) {
-    deblock::filter_frame_mbaff(
-        &mut ps.frame,
-        &ps.mb_info,
-        ps.mb_width as usize,
-        ps.disable_deblocking_filter_idc,
-        ps.slice_alpha_c0_offset_div2,
-        ps.slice_beta_offset_div2,
-        ps.chroma_qp_index_offset,
-        ps.mbaff_frame_flag,
-    );
+    if ps.mbaff_frame_flag || ps.field_pic_flag {
+        deblock::filter_frame_mbaff(
+            &mut ps.frame,
+            &ps.mb_info,
+            ps.mb_width as usize,
+            ps.disable_deblocking_filter_idc,
+            ps.slice_alpha_c0_offset_div2,
+            ps.slice_beta_offset_div2,
+            ps.chroma_qp_index_offset,
+            ps.mbaff_frame_flag,
+        );
+    } else if ps.deblocked_rows < ps.mb_height as usize {
+        deblock::deblock_mb_range(
+            &mut ps.frame,
+            &ps.mb_info,
+            ps.mb_width as usize,
+            ps.slice_alpha_c0_offset_div2.wrapping_mul(2),
+            ps.slice_beta_offset_div2.wrapping_mul(2),
+            ps.chroma_qp_index_offset,
+            ps.disable_deblocking_filter_idc,
+            ps.deblocked_rows * ps.mb_width as usize,
+            ps.mb_height as usize * ps.mb_width as usize,
+        );
+    }
 }
 
 /// Build the shared reference picture by moving the decoded planes out of
@@ -935,6 +945,7 @@ pub(crate) fn prepare_slice_job<P: crate::dpb::PicRef>(
                 field_pic_flag: header.field_pic_flag,
                 bottom_field_flag: header.bottom_field_flag,
                 frame_height,
+                deblocked_rows: 0,
             }
         };
 
@@ -1046,6 +1057,7 @@ let PictureState {
         field_pic_flag: _ps_field,
         bottom_field_flag: _ps_bottom,
         frame_height: _ps_frame_height,
+        deblocked_rows: mut deblocked_rows,
     } = ps;
 
     // Increment slice ID for continuation slices so boundary checks work
@@ -1168,7 +1180,51 @@ let PictureState {
     if mb_idx >= total_mbs {
         return Err(DecodeError::InvalidSyntax("first_mb_in_slice out of range"));
     }
+
+    // Row-granular deblock bookkeeping (progressive pictures): once the
+    // loop has passed a full MB row, finalize that row's metadata and
+    // deblock it immediately. The per-edge application order is identical
+    // to the whole-frame pass; deblocking row R after its MBs are decoded
+    // reads only rows R-1/R metadata, which is final.
+    let mut row_boundary = if !mbaff && !is_field_pic {
+        ((mb_idx / mb_width as usize) + 1) * mb_width as usize
+    } else {
+        usize::MAX
+    };
+    let mut finalized_upto = header.first_mb_in_slice as usize;
+    let deblock_in_loop = !mbaff && !is_field_pic && ps_deblock_idc != 1;
+
     while mb_idx < total_mbs {
+        if deblock_in_loop && mb_idx >= row_boundary {
+            let b = row_boundary;
+            {
+                let mut ctx = make_ctx!();
+                ctx.finalize_mb_info(finalized_upto, b, &params);
+            }
+            finalized_upto = b;
+            // Two-row lag: intra prediction of MB row R reads row R-1's
+            // reconstructed (pre-deblock) pixels, so row R-1 may only be
+            // deblocked once decoding has passed row R. With k rows
+            // decoded, rows < k-1 are deblockable; the tail is deblocked
+            // at finalize time (same order as the whole-frame pass).
+            let deblockable_row = (b / mb_width as usize).saturating_sub(1);
+            let upto_row = deblockable_row;
+            if deblocked_rows < upto_row {
+                deblock::deblock_mb_range(
+                    &mut frame,
+                    &mb_info,
+                    mb_width as usize,
+                    ps_alpha.wrapping_mul(2),
+                    ps_beta.wrapping_mul(2),
+                    ps_chroma_qp_offset,
+                    ps_deblock_idc,
+                    deblocked_rows * mb_width as usize,
+                    upto_row * mb_width as usize,
+                );
+                deblocked_rows = upto_row;
+            }
+            row_boundary += mb_width as usize;
+        }
         // CAVLC end-of-slice: check before reading any new syntax elements.
         // Skip this check when counting down a skip run (no reads needed).
         if !use_cabac && mb_skip_run <= 0 && !reader.more_rbsp_data() {
@@ -1292,9 +1348,13 @@ let PictureState {
         }
     }
 
-    // Post-loop: fill deblock info and ref POC table
+    // Post-loop: fill deblock info and ref POC table for the remaining
+    // tail (rows were finalized incrementally above when deblocking
+    // in-loop; the union of ranges matches the whole-slice call).
     let first_mb = if mbaff {
         (header.first_mb_in_slice as usize) * 2
+    } else if deblock_in_loop {
+        finalized_upto
     } else {
         header.first_mb_in_slice as usize
     };
@@ -1345,6 +1405,7 @@ let PictureState {
         field_pic_flag: header.field_pic_flag,
         bottom_field_flag: header.bottom_field_flag,
         frame_height,
+        deblocked_rows,
     })
 }
 

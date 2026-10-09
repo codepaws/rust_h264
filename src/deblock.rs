@@ -170,6 +170,37 @@ fn filter_frame_inner(
     // For horizontal edges: blocks above edge row
 
     for mb_idx in 0..mb_info.len() {
+        filter_mb(
+            frame,
+            mb_info,
+            mb_idx,
+            mb_width,
+            mbaff,
+            filter_offset_a,
+            filter_offset_b,
+            chroma_qp_index_offset,
+        );
+    }
+}
+
+/// Deblock one macroblock's vertical and horizontal edges (progressive or
+/// MBAFF). Split out of `filter_frame_inner` so row-granular callers
+/// (progressive decoding, see `deblock_mb_range`) share the exact same
+/// per-MB code path.
+#[allow(clippy::too_many_arguments)]
+fn filter_mb(
+    frame: &mut Frame,
+    mb_info: &[MbInfo],
+    mb_idx: usize,
+    mb_width: usize,
+    mbaff: bool,
+    filter_offset_a: i32,
+    filter_offset_b: i32,
+    chroma_qp_index_offset: i32,
+) {
+    let stride_y = frame.width as usize;
+    let stride_c = (frame.width / 2) as usize;
+
         // Compute spatial position and column/row for neighbor checks
         let (mb_x, mb_y, mb_col, mb_row) = if mbaff {
             let pair_addr = mb_idx / 2;
@@ -443,6 +474,39 @@ fn filter_frame_inner(
                 }
             }
         }
+}
+
+
+/// Deblock a contiguous range of macroblocks (progressive frames only).
+/// `first_mb..end_mb` must be MB-aligned row chunks for well-defined
+/// publish granularity, but any range is accepted — this is the same code
+/// path as the whole-frame filter, restricted to non-MBAFF addressing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn deblock_mb_range(
+    frame: &mut Frame,
+    mb_info: &[MbInfo],
+    mb_width: usize,
+    filter_offset_a: i32,
+    filter_offset_b: i32,
+    chroma_qp_index_offset: i32,
+    disable_deblocking_filter_idc: u32,
+    first_mb: usize,
+    end_mb: usize,
+) {
+    if disable_deblocking_filter_idc == 1 {
+        return;
+    }
+    for mb_idx in first_mb..end_mb.min(mb_info.len()) {
+        filter_mb(
+            frame,
+            mb_info,
+            mb_idx,
+            mb_width,
+            false,
+            filter_offset_a,
+            filter_offset_b,
+            chroma_qp_index_offset,
+        );
     }
 }
 
