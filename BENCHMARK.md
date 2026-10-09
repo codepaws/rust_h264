@@ -429,6 +429,21 @@ P-only case remains slower than 1 thread.)
   remaining single-thread gap to FFmpeg (~4-5x) lives in motion
   compensation dispatch overhead, intra prediction, the inverse
   transform, and entropy decode — in that order.
+- **Stage shares of single-threaded decode** (one-shot per-call timing;
+  the instrumented run itself ran ~2x slower, so MC's number is
+  corrected against uninstrumented totals and read as a range):
+  **motion compensation ~50-80%** (dominant; matches the original
+  author's 1080p profile of ~55% luma + ~14% chroma MC), deblock 8-15%,
+  inverse transform 1-3%, intra prediction <1%. Corrected against the
+  clean totals the arithmetic closes: MC + deblock + transform account
+  for ~90-100% of frame time, leaving little for entropy decode after
+  the `OFFSET_TO_BLOCK` optimizations. The single-thread priority is
+  unambiguous: **motion compensation** — block-fused, frame-dispatched
+  kernels (one `#[target_feature]` function per frame doing whole-MB
+  MC, no per-block calls), not further filter work. Per-block timing
+  was reverted after measurement (~100k MC calls/frame make timer
+  overhead exceed the work being measured); only the cheap
+  row-granular deblock accumulator ships.
 - **FFmpeg single-threaded is 2.6-3.4x faster than our best threaded
   result on this machine** — the x86 gap is larger than the 2.6-4x
   single-threaded gap on the original author's Mac. The remaining gap
