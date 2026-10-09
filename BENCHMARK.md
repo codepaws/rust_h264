@@ -412,6 +412,38 @@ P-only case remains slower than 1 thread.)
   maps to: deblock SIMD, IDCT/intra-pred SIMD, block-fused MC (per-row
   function dispatch overhead), and row-level threading.
 
+## Row-level reference synchronization (threading v2)
+
+The full-frame commit barrier meant each picture waited for its
+reference'''s *entire* decode+deblock before starting. Row-level sync
+replaces it: the shared `DecodedPicture` is allocated at dispatch and
+published MB-row by MB-row (deblock lag applied), and motion
+compensation waits per block for the motion-shifted sample window
+`[y_int-2, y_int+h+4]`. Dependent pictures now decode concurrently with
+their references (same machine, deblocking enabled, best of 3):
+
+| Stream | 1t | 4t (barrier) | 4t (row sync) | 8t (row sync) | FFmpeg 1t |
+|--------|---:|-------------:|--------------:|--------------:|----------:|
+| 1080p B + deblock | 62 | 93 fps | **189 fps** | **321 fps** | 321 fps |
+| 720p B + deblock  | 155 | 234 fps | **531 fps** | **851 fps** | 640 fps |
+| 720p P + deblock  | 234 | 210 fps | **689 fps** | — | 800 fps |
+
+- **2.0-3.3x over the barrier design at 4 threads**; the P-only chain —
+  the barrier design'''s worst case (4 threads was *slower* than 1) — is
+  now its best (2.9x over 1 thread), because consecutive P-pictures
+  pipeline MB-row by MB-row.
+- At 8 threads the threaded decoder **matches FFmpeg single-threaded at
+  1080p (321 fps) and exceeds it at 720p (851 vs 640 fps)** — the x86-64
+  gap versus FFmpeg'''s single thread is closed at the system level by
+  parallelism, even before the remaining SIMD work.
+- Output remains bit-identical to the serial decoder (full corpus
+  re-run, repeated for race coverage). Two bugs found during
+  development, both caught by those tests: a missing source-row offset
+  in the MV-array publish copy, and the MC wait using the unshifted y
+  instead of y_int.
+- Field pictures still require the serial Decoder; the worker-pool
+  follow-up (replacing spawn-per-picture) remains open.
+
 ## FFmpeg byte-exactness on real content
 
 `tools/verify_vs_ffmpeg.py` compares our output byte-for-byte against
