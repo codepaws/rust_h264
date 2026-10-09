@@ -3,6 +3,7 @@
 //! Stores decoded reference frames for use by P/B slice motion compensation.
 //! Manages short-term reference marking via sliding window (spec 8.2.5.3).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::nal::NalUnitType;
@@ -81,6 +82,26 @@ pub struct DecodedPicture {
     pub is_intra: bool,
     /// Whether this decoded picture is a frame, top field, or bottom field.
     pub structure: PictureStructure,
+    /// Pixel rows published so far (progressive decoding in the threaded
+    /// pipeline). `usize::MAX` means fully published — the state of every
+    /// serially-decoded picture. Readers call [`wait_rows`] before touching
+    /// pixels or MV arrays; the publishing worker uses Release stores after
+    /// writing a row's bytes.
+    pub row_progress: AtomicUsize,
+}
+
+impl DecodedPicture {
+    /// Block until at least `rows` pixel rows (and their MV arrays) are
+    /// published. No-op for serially-decoded pictures.
+    pub fn wait_rows(&self, rows: usize) {
+        if self.row_progress.load(Ordering::Acquire) >= rows {
+            return;
+        }
+        while self.row_progress.load(Ordering::Acquire) < rows {
+            std::hint::spin_loop();
+            std::thread::yield_now();
+        }
+    }
 }
 
 /// A DPB entry wrapping a picture handle with mutable status.
@@ -759,6 +780,7 @@ mod tests {
             mb_width: 1,
             is_intra: false,
             structure: crate::dpb::PictureStructure::Frame,
+            row_progress: AtomicUsize::new(usize::MAX),
         })
     }
 

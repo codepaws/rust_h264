@@ -29,12 +29,12 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 use crate::decoder::{
     apply_reference_marking, crop_to_display, deblock_picture, prepare_slice_job, run_slice_job,
-    take_decoded_picture, Frame, PictureState, SliceJob, SliceJobShell,
+    Frame, PictureState, SliceJob, SliceJobShell,
 };
 use crate::dpb::{DecodedPicture, Dpb, PicRef, PictureStructure};
 use crate::error::DecodeError;
@@ -83,13 +83,6 @@ struct OpenPicture {
     slot: SharedSlot,
 }
 
-struct CommitBarrier {
-    /// Highest consecutively-committed seq + 1 (i.e. pictures 0..committed
-    /// are complete and their slots are filled).
-    committed: Mutex<u64>,
-    cv: Condvar,
-}
-
 /// H.264 decoder that pipelines pictures across worker threads and emits
 /// frames in display order — the threaded counterpart of
 /// [`OrderedDecoder`](crate::decoder::OrderedDecoder).
@@ -124,15 +117,14 @@ pub struct ThreadedDecoder {
     next_seq: u64,
     /// First picture not yet committed; frames commit strictly in order.
     commit_next: u64,
-    barrier: Arc<CommitBarrier>,
-    /// Slot (and metadata) per scheduled seq, for commits.
-    slots: HashMap<u64, (SharedSlot, u32)>, // (slot, gop_id)
+    /// GOP id per scheduled seq, for the reorder buffer at commit time.
+    slots: HashMap<u64, u32>,
     /// Slot identity -> seq, to compute a picture's commit dependencies.
     slot_seqs: HashMap<usize, u64>,
     inflight: VecDeque<JoinHandle<()>>,
-    completed: BTreeMap<u64, Result<PictureState, DecodeError>>,
-    done_rx: Receiver<(u64, Result<PictureState, DecodeError>)>,
-    done_tx: Sender<(u64, Result<PictureState, DecodeError>)>,
+    completed: BTreeMap<u64, Result<Frame, DecodeError>>,
+    done_rx: Receiver<(u64, Result<Frame, DecodeError>)>,
+    done_tx: Sender<(u64, Result<Frame, DecodeError>)>,
     first_error: Option<DecodeError>,
     // Display-order reorder buffer (OrderedDecoder semantics).
     buffer: Vec<(u32, Frame)>,
@@ -155,10 +147,6 @@ impl ThreadedDecoder {
             open: None,
             next_seq: 0,
             commit_next: 0,
-            barrier: Arc::new(CommitBarrier {
-                committed: Mutex::new(0),
-                cv: Condvar::new(),
-            }),
             slots: HashMap::new(),
             slot_seqs: HashMap::new(),
             inflight: VecDeque::new(),
@@ -271,7 +259,7 @@ impl ThreadedDecoder {
                             let seq = self.next_seq;
                             self.next_seq += 1;
                             let slot: SharedSlot = Arc::new(OnceLock::new());
-                            self.slots.insert(seq, (slot.clone(), self.gop_id));
+                            self.slots.insert(seq, self.gop_id);
                             self.open = Some(OpenPicture { seq, slot });
                         }
                         self.pending = Some(ps);
@@ -328,10 +316,7 @@ impl ThreadedDecoder {
         let slices = std::mem::take(&mut self.open_slices);
 
         // Speculative reference marking on the shadow DPB, exactly the
-        // sequence the serial decoder applies when finalizing this picture
-        // (i.e. when the next picture starts). Uses the last slice's header,
-        // like the serial path. Until this runs, the picture is not in the
-        // shadow DPB, so continuation slices never see it in their lists.
+        // sequence the serial decoder applies when finalizing this picture.
         let last = slices.last().expect("open picture has slices");
         let planned = PlannedPic {
             slot: open.slot.clone(),
@@ -352,37 +337,40 @@ impl ThreadedDecoder {
         self.slot_seqs
             .insert(Arc::as_ptr(&open.slot) as usize, open.seq);
 
-        // Commit dependency: the newest reference picture of any slice.
-        let needed = slices
-            .iter()
-            .flat_map(|s| {
-                s.shell
-                    .ref_pic_list
-                    .iter()
-                    .chain(s.shell.ref_pic_list_l0.iter())
-                    .chain(s.shell.ref_pic_list_l1.iter())
-            })
-            .filter_map(|p| self.slot_seqs.get(&(Arc::as_ptr(&p.slot) as usize)).copied())
-            .max()
-            .map(|m| m + 1)
-            .unwrap_or(0);
+        // Allocate the shared picture and publish it in the slot now:
+        // dependent workers materialize it immediately and wait per row
+        // during motion compensation instead of waiting for the whole
+        // frame (row-level reference synchronization).
+        let mb_w = ps.mb_width as usize;
+        let mb_h = ps.mb_height as usize;
+        let stride = mb_w * 16;
+        let blocks = mb_w * mb_h * 16;
+        let pic = Arc::new(DecodedPicture {
+            y: vec![0u8; stride * mb_h * 16],
+            u: vec![0u8; (stride / 2) * (mb_h * 8)],
+            v: vec![0u8; (stride / 2) * (mb_h * 8)],
+            width: stride as u32,
+            height: (mb_h * 16) as u32,
+            frame_num: ps.frame_num,
+            pic_order_cnt: ps.poc,
+            mv_l0: vec![[0i16; 2]; blocks],
+            ref_idx_l0: vec![-1i8; blocks],
+            ref_poc_l0: vec![-1i32; blocks],
+            mv_l1: vec![[0i16; 2]; blocks],
+            ref_idx_l1: vec![-1i8; blocks],
+            mb_width: ps.mb_width,
+            is_intra: ps.is_intra_slice,
+            structure: PictureStructure::Frame,
+            row_progress: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let _ = open.slot.set(Arc::clone(&pic));
 
-        let barrier = Arc::clone(&self.barrier);
         let done_tx = self.done_tx.clone();
         let seq = open.seq;
-        let worker = move || {
-            // Wait until all reference pictures are committed.
-            {
-                let mut committed = barrier.committed.lock().unwrap();
-                while *committed < needed {
-                    committed = barrier.cv.wait(committed).unwrap();
-                }
-            }
-            // Materialize reference lists (slots are guaranteed full now).
-            let result = run_picture(&slices, ps);
+        let handle = std::thread::spawn(move || {
+            let result = run_picture(&slices, ps, &pic);
             let _ = done_tx.send((seq, result));
-        };
-        let handle = std::thread::spawn(worker);
+        });
         self.inflight.push_back(handle);
         Ok(())
     }
@@ -401,27 +389,13 @@ impl ThreadedDecoder {
             let Some(res) = self.completed.remove(&seq) else {
                 break;
             };
-            let (slot, gop) = self
-                .slots
-                .remove(&seq)
-                .expect("slot for scheduled picture");
+            let gop = self.slots.remove(&seq).expect("gop for scheduled picture");
             match res {
-                Ok(mut ps) => {
-                    // Output frame: cropped copy of the coded picture.
-                    // DPB picture: the coded planes, moved (same number of
-                    // full-frame copies as the serial path, which clones
-                    // into the Arc and crops its own copy in place).
-                    let coded_w = (ps.mb_width * 16) as usize;
-                    let mut frame = ps.frame.clone();
-                    crop_to_display(&mut frame, coded_w);
-                    let pic = take_decoded_picture(&mut ps);
-                    let _ = slot.set(pic);
+                Ok(frame) => {
                     self.decoded_frames.fetch_add(1, Ordering::Relaxed);
                     self.buffer.push((gop, frame));
-                    // OrderedDecoder drains a completed GOP as one
-                    // POC-sorted batch when the IDR NAL arrives. Commits are
-                    // coded-ordered, so the first commit of a new GOP proves
-                    // every older GOP is complete — drain them here, sorted.
+                    // Match OrderedDecoder's per-NAL order exactly: drain
+                    // completed GOPs first, then enforce the depth bound.
                     self.drain_stale_gops(gop, out);
                     while self.buffer.len() > self.max_depth {
                         let f = self.pop_lowest();
@@ -432,32 +406,7 @@ impl ThreadedDecoder {
                     if self.first_error.is_none() {
                         self.first_error = Some(e);
                     }
-                    // Keep the pipeline alive: publish an empty picture so
-                    // dependent frames can still decode.
-                    let _ = slot.set(Arc::new(DecodedPicture {
-                        y: Vec::new(),
-                        u: Vec::new(),
-                        v: Vec::new(),
-                        width: 0,
-                        height: 0,
-                        frame_num: 0,
-                        pic_order_cnt: 0,
-                        mv_l0: Vec::new(),
-                        ref_idx_l0: Vec::new(),
-                        ref_poc_l0: Vec::new(),
-                        mv_l1: Vec::new(),
-                        ref_idx_l1: Vec::new(),
-                        mb_width: 0,
-                        is_intra: false,
-                        structure: PictureStructure::Frame,
-                    }));
                 }
-            }
-            // Advance the commit barrier and wake waiting workers.
-            {
-                let mut committed = self.barrier.committed.lock().unwrap();
-                *committed = seq + 1;
-                self.barrier.cv.notify_all();
             }
             self.commit_next = seq + 1;
         }
@@ -518,31 +467,186 @@ impl ThreadedDecoder {
     }
 }
 
-/// Worker-side: run all slices of one picture, then deblock.
-fn run_picture(slices: &[ThreadSlice], mut ps: PictureState) -> Result<PictureState, DecodeError> {
-    for (i, slice) in slices.iter().enumerate() {
-        // Materialize real reference pictures for this slice.
-        let job: SliceJob = materialize(&slice.shell);
-        if i == 0 {
-            match run_slice_job(&job, ps, &slice.rbsp) {
-                Ok(done) => ps = done,
-                Err(e) => return Err(e),
+/// Worker-side: run all slices of one picture, publishing rows into the
+/// shared picture as the decode loop completes them (deblock lag included),
+/// then deblock the tail and return the cropped output frame.
+///
+/// On error the shared picture's progress is set to complete so dependent
+/// workers blocked on its rows read the (zero) pixels instead of hanging —
+/// the same garbage-in behavior as the serial decoder's error path.
+fn run_picture(
+    slices: &[ThreadSlice],
+    mut ps: PictureState,
+    shared: &Arc<DecodedPicture>,
+) -> Result<Frame, DecodeError> {
+    let mb_w = ps.mb_width as usize;
+    let result = run_picture_inner(slices, &mut ps, shared);
+    if let Err(e) = result {
+        shared
+            .row_progress
+            .store(usize::MAX, std::sync::atomic::Ordering::Release);
+        return Err(e);
+    }
+    let mut frame = ps.frame;
+    crop_to_display(&mut frame, mb_w * 16);
+    Ok(frame)
+}
+
+fn run_picture_inner(
+    slices: &[ThreadSlice],
+    ps: &mut PictureState,
+    shared: &Arc<DecodedPicture>,
+) -> Result<(), DecodeError> {
+    let mut published = 0usize;
+
+    {
+        let shared = Arc::clone(shared);
+        let mut on_row = |r: usize,
+                          frame: &Frame,
+                          mv_l0: &[[i16; 2]],
+                          ri_l0: &[i8],
+                          rp_l0: &[i32],
+                          mv_l1: &[[i16; 2]],
+                          ri_l1: &[i8]| {
+            if r != published {
+                return; // rows arrive in order; ignore re-announcements
             }
-        } else {
-            // Continuation: keep a backup so an end-of-slice error doesn't
-            // lose already-decoded MBs (mirrors the serial decoder).
-            let backup = ps.clone();
-            match run_slice_job(&job, ps, &slice.rbsp) {
-                Ok(done) => ps = done,
-                Err(_) => {
-                    ps = backup;
-                    break;
+            publish_row(&shared, r, frame, mv_l0, ri_l0, rp_l0, mv_l1, ri_l1);
+            published = r + 1;
+        };
+
+        for (i, slice) in slices.iter().enumerate() {
+            let job: SliceJob = materialize(&slice.shell);
+            let taken = std::mem::replace(ps, PictureState::empty());
+            if i == 0 {
+                match run_slice_job(&job, taken, &slice.rbsp, &mut on_row) {
+                    Ok(done) => *ps = done,
+                    Err(e) => return Err(e),
+                }
+            } else {
+                let backup = ps.clone();
+                match run_slice_job(&job, taken, &slice.rbsp, &mut on_row) {
+                    Ok(done) => *ps = done,
+                    Err(_) => {
+                        *ps = backup;
+                        break;
+                    }
                 }
             }
         }
     }
-    deblock_picture(&mut ps);
-    Ok(ps)
+
+    deblock_picture(ps);
+    // Publish the tail rows (the deblock lag leaves up to two unpublished)
+    // and mark the picture complete.
+    let mb_h = ps.mb_height as usize;
+    for r in published..mb_h {
+        publish_row(
+            shared,
+            r,
+            &ps.frame,
+            &ps.mv_store_l0,
+            &ps.ref_idx_store_l0,
+            &ps.ref_poc_store_l0,
+            &ps.mv_store_l1,
+            &ps.ref_idx_store_l1,
+        );
+    }
+    shared
+        .row_progress
+        .store(usize::MAX, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+/// Copy one MB row's pixels and MV arrays into the shared picture, then
+/// publish it with a Release store (readers acquire-load `row_progress`
+/// before touching the bytes).
+///
+/// # Safety contract
+/// Single writer (the owning worker) plus readers that have observed
+/// `row_progress > r*16` via acquire. Rows below `r` are never written
+/// again, so overlapping readers of earlier rows are sound.
+#[allow(clippy::too_many_arguments)]
+fn publish_row(
+    shared: &Arc<DecodedPicture>,
+    r: usize,
+    frame: &Frame,
+    mv_l0: &[[i16; 2]],
+    ri_l0: &[i8],
+    rp_l0: &[i32],
+    mv_l1: &[[i16; 2]],
+    ri_l1: &[i8],
+) {
+    let mb_w = shared.mb_width as usize;
+    let stride = mb_w * 16;
+    let c_stride = stride / 2;
+
+    unsafe fn copy_bytes(dst: *const u8, src: *const u8, off: usize, len: usize) {
+        std::ptr::copy_nonoverlapping(src, dst.add(off) as *mut u8, len);
+    }
+    // SAFETY: the shared planes are sized for exactly these ranges; see the
+    // safety contract above.
+    unsafe {
+        for dy in 0..16 {
+            let y = r * 16 + dy;
+            copy_bytes(
+                shared.y.as_ptr(),
+                frame.y.as_ptr().add(y * stride),
+                y * stride,
+                stride,
+            );
+        }
+        for dy in 0..8 {
+            let cy = r * 8 + dy;
+            copy_bytes(
+                shared.u.as_ptr(),
+                frame.u.as_ptr().add(cy * c_stride),
+                cy * c_stride,
+                c_stride,
+            );
+            copy_bytes(
+                shared.v.as_ptr(),
+                frame.v.as_ptr().add(cy * c_stride),
+                cy * c_stride,
+                c_stride,
+            );
+        }
+        let base = r * mb_w * 16;
+        let len = mb_w * 16;
+        copy_bytes(
+            shared.mv_l0.as_ptr() as *const u8,
+            (mv_l0.as_ptr() as *const u8).add(base * 4),
+            base * 4,
+            len * 4,
+        );
+        copy_bytes(
+            shared.ref_idx_l0.as_ptr() as *const u8,
+            (ri_l0.as_ptr() as *const u8).add(base),
+            base,
+            len,
+        );
+        copy_bytes(
+            shared.ref_poc_l0.as_ptr() as *const u8,
+            (rp_l0.as_ptr() as *const u8).add(base * 4),
+            base * 4,
+            len * 4,
+        );
+        copy_bytes(
+            shared.mv_l1.as_ptr() as *const u8,
+            (mv_l1.as_ptr() as *const u8).add(base * 4),
+            base * 4,
+            len * 4,
+        );
+        copy_bytes(
+            shared.ref_idx_l1.as_ptr() as *const u8,
+            (ri_l1.as_ptr() as *const u8).add(base),
+            base,
+            len,
+        );
+    }
+    shared
+        .row_progress
+        .store((r + 1) * 16, std::sync::atomic::Ordering::Release);
 }
 
 /// Convert a prepared slice with planned references into one with real

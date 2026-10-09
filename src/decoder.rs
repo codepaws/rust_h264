@@ -358,7 +358,8 @@ impl Decoder {
             ref_idx_l1: ps.ref_idx_store_l1,
             mb_width: ps.mb_width,
             is_intra: ps.is_intra_slice,
-            structure: if ps.field_pic_flag {
+            row_progress: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        structure: if ps.field_pic_flag {
                 if ps.bottom_field_flag {
                     crate::dpb::PictureStructure::BottomField
                 } else {
@@ -512,7 +513,7 @@ impl Decoder {
                 return Err(e);
             }
         };
-        let ps = run_slice_job(&job, ps, &nal.rbsp)?;
+        let ps = run_slice_job(&job, ps, &nal.rbsp, &mut |_, _, _, _, _, _, _| {})?;
         self.pending = Some(ps);
         Ok(())
     }
@@ -540,6 +541,65 @@ pub(crate) struct SliceJobShell<P: crate::dpb::PicRef> {
 
 /// A prepared slice with materialized (real) reference pictures.
 pub(crate) type SliceJob = SliceJobShell<Arc<DecodedPicture>>;
+
+impl PictureState {
+    /// Empty placeholder used for `std::mem::replace` transfers; replaced
+    /// immediately by the decode call's return value.
+    pub(crate) fn empty() -> Self {
+        Self {
+            frame: Frame {
+                width: 0,
+                height: 0,
+                y: Vec::new(),
+                u: Vec::new(),
+                v: Vec::new(),
+                pic_order_cnt: 0,
+            },
+            frame_num: 0,
+            poc: 0,
+            nal_unit_type: NalUnitType::Slice,
+            nal_ref_idc: 0,
+            nc_luma: Vec::new(),
+            nc_cb: Vec::new(),
+            nc_cr: Vec::new(),
+            mv_store_l0: Vec::new(),
+            mv_store_l1: Vec::new(),
+            ref_idx_store_l0: Vec::new(),
+            ref_poc_store_l0: Vec::new(),
+            ref_idx_store_l1: Vec::new(),
+            mvd_store: Vec::new(),
+            mvd_store_l1: Vec::new(),
+            mb_info: Vec::new(),
+            i4x4_modes: Vec::new(),
+            mb_cbp: Vec::new(),
+            mb_chroma_pred: Vec::new(),
+            mb_is_8x8dct: Vec::new(),
+            mb_skip: Vec::new(),
+            mb_is_direct: Vec::new(),
+            blk_is_direct: Vec::new(),
+            is_i16x16: Vec::new(),
+            mb_slice_id: Vec::new(),
+            current_slice_id: 0,
+            prev_mb_qp: 0,
+            last_qp_delta_nonzero: false,
+            mmco_ops: Vec::new(),
+            long_term_reference_flag: false,
+            is_intra_slice: false,
+            disable_deblocking_filter_idc: 0,
+            slice_alpha_c0_offset_div2: 0,
+            slice_beta_offset_div2: 0,
+            chroma_qp_index_offset: 0,
+            mb_width: 0,
+            mb_height: 0,
+            mb_field_decoding: Vec::new(),
+            mbaff_frame_flag: false,
+            field_pic_flag: false,
+            bottom_field_flag: false,
+            frame_height: 0,
+            deblocked_rows: 0,
+        }
+    }
+}
 
 /// Apply the in-loop deblocking filter to a finished picture state
 /// (frame-local: pixels plus per-MB metadata only).
@@ -570,36 +630,7 @@ pub(crate) fn deblock_picture(ps: &mut PictureState) {
     }
 }
 
-/// Build the shared reference picture by moving the decoded planes out of
-/// the picture state (used by the threaded pipeline; the serial path
-/// clones instead because it keeps cropping the frame afterwards).
-pub(crate) fn take_decoded_picture(ps: &mut PictureState) -> Arc<DecodedPicture> {
-    Arc::new(DecodedPicture {
-        y: std::mem::take(&mut ps.frame.y),
-        u: std::mem::take(&mut ps.frame.u),
-        v: std::mem::take(&mut ps.frame.v),
-        width: ps.mb_width * 16,
-        height: (ps.frame.height.div_ceil(16)) * 16,
-        frame_num: ps.frame_num,
-        pic_order_cnt: ps.poc,
-        mv_l0: std::mem::take(&mut ps.mv_store_l0),
-        ref_idx_l0: std::mem::take(&mut ps.ref_idx_store_l0),
-        ref_poc_l0: std::mem::take(&mut ps.ref_poc_store_l0),
-        mv_l1: std::mem::take(&mut ps.mv_store_l1),
-        ref_idx_l1: std::mem::take(&mut ps.ref_idx_store_l1),
-        mb_width: ps.mb_width,
-        is_intra: ps.is_intra_slice,
-        structure: if ps.field_pic_flag {
-            if ps.bottom_field_flag {
-                crate::dpb::PictureStructure::BottomField
-            } else {
-                crate::dpb::PictureStructure::TopField
-            }
-        } else {
-            crate::dpb::PictureStructure::Frame
-        },
-    })
-}
+
 
 /// Crop a frame from coded (MB-aligned) dimensions to display dimensions,
 /// in place. `coded_w` is the coded luma width.
@@ -974,10 +1005,21 @@ pub(crate) fn prepare_slice_job<P: crate::dpb::PicRef>(
 /// picture state. Pure with respect to decoder-global state: everything
 /// comes from `job`, `ps`, and the RBSP bytes, so this is what worker
 /// threads execute in the threaded pipeline.
+pub(crate) type RowPublish<'a> = &'a mut dyn FnMut(
+    usize,
+    &Frame,
+    &[[i16; 2]],
+    &[i8],
+    &[i32],
+    &[[i16; 2]],
+    &[i8],
+);
+
 pub(crate) fn run_slice_job(
     job: &SliceJob,
     ps: PictureState,
     rbsp: &[u8],
+    on_row: RowPublish,
 ) -> Result<PictureState, DecodeError> {
     let header = &job.header;
     let sps = &job.sps;
@@ -1057,7 +1099,7 @@ let PictureState {
         field_pic_flag: _ps_field,
         bottom_field_flag: _ps_bottom,
         frame_height: _ps_frame_height,
-        deblocked_rows: mut deblocked_rows,
+        mut deblocked_rows,
     } = ps;
 
     // Increment slice ID for continuation slices so boundary checks work
@@ -1193,6 +1235,7 @@ let PictureState {
     };
     let mut finalized_upto = header.first_mb_in_slice as usize;
     let deblock_in_loop = !mbaff && !is_field_pic && ps_deblock_idc != 1;
+    let mut announced = 0usize;
 
     while mb_idx < total_mbs {
         if deblock_in_loop && mb_idx >= row_boundary {
@@ -1222,6 +1265,16 @@ let PictureState {
                     upto_row * mb_width as usize,
                 );
                 deblocked_rows = upto_row;
+                // Rows strictly above the newly-deblocked range are final
+                // (their bottom pixel rows were settled by the top edge of
+                // the row below); announce them to the publisher.
+                let publishable = upto_row.saturating_sub(1);
+                for r in announced..publishable {
+                    on_row(r, &frame, &mv_store_l0, &ref_idx_store_l0, &ref_poc_store_l0, &mv_store_l1, &ref_idx_store_l1);
+                }
+                if publishable > announced {
+                    announced = publishable;
+                }
             }
             row_boundary += mb_width as usize;
         }

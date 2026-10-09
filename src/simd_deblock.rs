@@ -41,6 +41,7 @@ use crate::simd_x86::{level, SimdLevel};
 ///
 /// **Dormant** — see module docs (measured parity with the scalar loop).
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn deblock_luma_v16(
     plane: &mut [u8],
     stride: usize,
@@ -75,6 +76,7 @@ pub(crate) fn deblock_luma_v16(
 ///
 /// **Dormant** — see module docs (measured parity with the scalar loop).
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn deblock_luma_h16(
     plane: &mut [u8],
     stride: usize,
@@ -108,6 +110,7 @@ pub(crate) fn deblock_luma_h16(
 /// and the scatter for fully-inactive edges (the common case).
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
+#[allow(dead_code, non_snake_case)]
 unsafe fn gate_any(
     p1: __m128i,
     p0: __m128i,
@@ -156,6 +159,7 @@ fn seg_vec(vals: [i32; 4], lanes: usize, offset: usize) -> __m128i {
 /// Returns `(np2, np1, np0, nq0, nq1, nq2)`.
 #[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
+#[allow(non_snake_case)]
 unsafe fn deblock_core(
     p2: __m128i,
     p1: __m128i,
@@ -609,6 +613,7 @@ pub(crate) fn scalar_deblock_luma_segment(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 #[inline(never)]
+#[allow(non_snake_case)]
 unsafe fn sse2_deblock_luma_segment(
     s: &mut [[u8; 8]; 4],
     bs: i32,

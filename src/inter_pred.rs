@@ -394,6 +394,13 @@ pub fn luma_mc_stride(
     let x_int = x + (dx >> 2);
     let y_int = y + (dy >> 2);
 
+    // Row-level sync: the reference may still be decoding (threaded
+    // pipeline). MC reads rows around the MOTION-SHIFTED position
+    // [y_int-2, y_int+h+4] worst case (margin 3 + quarter-pel extra 1);
+    // waits are no-ops for fully-published (serial) pictures.
+    let need_rows = (y_int + block_h as i32 + 4).clamp(0, ref_pic.height as i32) as usize;
+    ref_pic.wait_rows(need_rows);
+
     let pic_w = ref_pic.width as i32;
     let pic_h = if ref_stride == ref_pic.width as usize {
         ref_pic.height as i32
@@ -482,6 +489,7 @@ pub fn luma_mc_stride(
             mb_width: 0,
             is_intra: false,
             structure: crate::dpb::PictureStructure::Frame,
+            row_progress: std::sync::atomic::AtomicUsize::new(usize::MAX),
         };
         for row in 0..block_h {
             for col in 0..block_w {
@@ -1186,6 +1194,7 @@ mod tests {
             mb_width: width / 16,
             is_intra: false,
             structure: crate::dpb::PictureStructure::Frame,
+            row_progress: std::sync::atomic::AtomicUsize::new(usize::MAX),
         })
     }
 

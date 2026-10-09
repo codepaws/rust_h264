@@ -477,6 +477,10 @@ pub(crate) fn derive_spatial_direct_blk(
             col_blk
         };
         let col_pos = mb_idx * 16 + effective_blk;
+        // Row-level sync: the co-located picture may still be decoding.
+        let per_row = col.mb_width as usize * 16;
+        let need = ((mb_idx * 16) / per_row + 1) * 16;
+        col.wait_rows(need);
         if col_pos < col.ref_idx_l0.len() && !col.is_intra {
             let col_ref_l0 = col.ref_idx_l0[col_pos];
             // Determine which co-located MV to use for the zero check:
@@ -552,6 +556,10 @@ pub(crate) fn derive_temporal_direct_blk(
         blk
     };
     let col_base = mb_idx * 16;
+    // Row-level sync: the co-located picture may still be decoding.
+    let per_row = col_pic.mb_width as usize * 16;
+    let need = (col_base / per_row + 1) * 16;
+    col_pic.wait_rows(need);
     if col_pic.is_intra
         || col_base + col_blk >= col_pic.ref_idx_l0.len()
         || col_pic.ref_idx_l0[col_base + col_blk] < 0

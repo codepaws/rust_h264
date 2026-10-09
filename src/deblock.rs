@@ -158,9 +158,6 @@ fn filter_frame_inner(
 
     let filter_offset_a = slice_alpha_c0_offset_div2.wrapping_mul(2);
     let filter_offset_b = slice_beta_offset_div2.wrapping_mul(2);
-    let stride_y = frame.width as usize;
-    let stride_c = (frame.width / 2) as usize;
-
     // 4x4 block index layout within an MB (raster scan):
     //  0  1  4  5
     //  2  3  6  7
