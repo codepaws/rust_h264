@@ -398,14 +398,18 @@ P-only case remains slower than 1 thread.)
   chained P-pictures (each waits for its reference's full commit), so
   threading only adds overhead there. Row-level reference sync is the
   structural fix.
-- A 4-lane SSE2 luma segment kernel (`src/simd_deblock.rs`, bit-exact,
-  differentially tested) was measured through an in-place
-  gather/scatter integration: **-6..9% vs the original scalar loop**
-  (720p B: 169 vs 180-185 fps) — the per-segment block copy costs more
-  than the kernel saves. It is committed dormant; the worthwhile design
-  is a 16-lane byte-domain kernel with in-register transposes operating
-  directly on the plane (FFmpeg-style), for which the module's math and
-  tests are the building blocks.
+- Deblock SIMD was attempted twice and measured at parity with the
+  branchy scalar loop both times: a 4-lane gather/scatter integration
+  (-6..9%) and a 16-lane byte-domain whole-edge kernel with in-register
+  transposes, movemask gate early-outs, and per-bs path guards
+  (-3.2% at 720p / +1.4% at 1080p). On gate-dense content the scalar
+  loop's per-row early exits cost less than branchless vector paths.
+  Both kernels were deleted after measurement (bit-exact and
+  differentially tested; preserved in commits 187294a and f3845c4) —
+  dormant code rots. A future attempt should target dedicated per-bs
+  kernels like FFmpeg's rather than generic vectorization; the
+  row-granular in-loop deblock (below) also changed the integration
+  calculus.
 - **FFmpeg single-threaded is 2.6-3.4x faster than our best threaded
   result on this machine** — the x86 gap is larger than the 2.6-4x
   single-threaded gap on the original author's Mac. The remaining gap
