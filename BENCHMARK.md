@@ -385,9 +385,12 @@ ffmpeg -f lavfi -i "testsrc2=s=1280x720:rate=30:duration=10" -frames:v 300   -c:
 
 | Stream | rust_h264 1t | rust_h264 4t | FFmpeg `-threads 1` | FFmpeg / rust_h264 4t |
 |--------|-------------:|-------------:|--------------------:|----------------------:|
-| 1080p B + deblock | 70 fps | 95 fps | 321 fps | 3.4x |
-| 720p B + deblock  | 159 fps | 241 fps | 620 fps | 2.6x |
-| 720p P + deblock  | 262 fps | 233 fps | 800 fps | 3.4x |
+| 1080p B + deblock | 71 fps | 106 fps | 321 fps | 3.0x |
+| 720p B + deblock  | 166 fps | 252 fps | 640 fps | 2.5x |
+| 720p P + deblock  | 269 fps | 244 fps | 800 fps | 3.3x |
+
+(Re-validated on an idle machine with interleaved A/B runs; the 4-thread
+P-only case remains slower than 1 thread.)
 
 - Deblocking costs **16-30% single-threaded** (83->70, 227->159, 318->262).
 - With deblocking, the 4-thread P-only case is **slower** than 1 thread:
@@ -395,6 +398,14 @@ ffmpeg -f lavfi -i "testsrc2=s=1280x720:rate=30:duration=10" -frames:v 300   -c:
   chained P-pictures (each waits for its reference's full commit), so
   threading only adds overhead there. Row-level reference sync is the
   structural fix.
+- A 4-lane SSE2 luma segment kernel (`src/simd_deblock.rs`, bit-exact,
+  differentially tested) was measured through an in-place
+  gather/scatter integration: **-6..9% vs the original scalar loop**
+  (720p B: 169 vs 180-185 fps) — the per-segment block copy costs more
+  than the kernel saves. It is committed dormant; the worthwhile design
+  is a 16-lane byte-domain kernel with in-register transposes operating
+  directly on the plane (FFmpeg-style), for which the module's math and
+  tests are the building blocks.
 - **FFmpeg single-threaded is 2.6-3.4x faster than our best threaded
   result on this machine** — the x86 gap is larger than the 2.6-4x
   single-threaded gap on the original author's Mac. The remaining gap
