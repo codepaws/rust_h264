@@ -1569,12 +1569,11 @@ impl SliceContext<'_> {
                     } // close if use_8x8_inter else
                       // Add residual to prediction
                     for r in 0..16 {
+                        let dst_off = self.ly_offset + r * self.ly_stride + mb_x;
+                        let row = &mut self.frame.y[dst_off..dst_off + 16];
+                        let res = &luma_residual[r * 16..r * 16 + 16];
                         for c in 0..16 {
-                            let val = (self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c]
-                                as i32
-                                + luma_residual[r * 16 + c])
-                                .clamp(0, 255) as u8;
-                            self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c] = val;
+                            row[c] = (row[c] as i32 + res[c]).clamp(0, 255) as u8;
                         }
                     }
                 }
@@ -3156,12 +3155,11 @@ impl SliceContext<'_> {
                         }
                     } // close if use_8x8_b_inter else
                     for r in 0..16 {
+                        let dst_off = self.ly_offset + r * self.ly_stride + mb_x;
+                        let row = &mut self.frame.y[dst_off..dst_off + 16];
+                        let res = &luma_residual[r * 16..r * 16 + 16];
                         for c in 0..16 {
-                            let val = (self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c]
-                                as i32
-                                + luma_residual[r * 16 + c])
-                                .clamp(0, 255) as u8;
-                            self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c] = val;
+                            row[c] = (row[c] as i32 + res[c]).clamp(0, 255) as u8;
                         }
                     }
                 }

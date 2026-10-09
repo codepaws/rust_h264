@@ -1269,10 +1269,12 @@ impl SliceContext<'_> {
             &mut luma_pred,
         );
         for r in 0..16 {
+            let dst_off = self.ly_offset + r * self.ly_stride + mb_x;
+            let row = &mut self.frame.y[dst_off..dst_off + 16];
+            let pred = &luma_pred[r * 16..r * 16 + 16];
+            let res = &luma_residual[r * 16..r * 16 + 16];
             for c in 0..16 {
-                let val =
-                    (luma_pred[r * 16 + c] as i32 + luma_residual[r * 16 + c]).clamp(0, 255) as u8;
-                self.frame.y[self.ly_offset + r * self.ly_stride + mb_x + c] = val;
+                row[c] = (pred[c] as i32 + res[c]).clamp(0, 255) as u8;
             }
         }
     }
