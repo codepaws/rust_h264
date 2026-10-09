@@ -44,6 +44,7 @@ fn avg(a: u8, b: u8) -> u8 {
 
 /// 6-tap FIR filter coefficient application on 6 consecutive samples.
 #[inline(always)]
+#[cfg_attr(any(target_arch = "x86_64"), allow(dead_code))]
 fn fir6(s: &[u8], i: usize) -> i32 {
     s[i] as i32 - 5 * s[i + 1] as i32 + 20 * s[i + 2] as i32 + 20 * s[i + 3] as i32
         - 5 * s[i + 4] as i32
@@ -52,6 +53,7 @@ fn fir6(s: &[u8], i: usize) -> i32 {
 
 /// 6-tap FIR on i32 intermediates (for hv second pass).
 #[inline(always)]
+#[cfg_attr(target_arch = "x86_64", allow(dead_code))]
 fn fir6_i32(s0: i32, s1: i32, s2: i32, s3: i32, s4: i32, s5: i32) -> i32 {
     s0 - 5 * s1 + 20 * s2 + 20 * s3 - 5 * s4 + s5
 }
@@ -147,7 +149,11 @@ fn row_half_pel_h(src: &[u8], out: &mut [u8], w: usize) {
     {
         neon_row_half_pel_h(src, out, w);
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::simd_x86::row_half_pel_h(src, out, w);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         for i in 0..w {
             out[i] = clip_u8((fir6(src, i) + 16) >> 5);
@@ -295,7 +301,11 @@ fn row_half_pel_v(rows: [&[u8]; 6], out: &mut [u8], w: usize) {
     {
         neon_row_half_pel_v(rows, out, w);
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::simd_x86::row_half_pel_v(rows, out, w);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         for i in 0..w {
             let val = rows[0][i] as i32 - 5 * rows[1][i] as i32
@@ -313,17 +323,24 @@ fn row_half_pel_v(rows: [&[u8]; 6], out: &mut [u8], w: usize) {
 #[allow(clippy::needless_range_loop)]
 #[inline(always)]
 fn row_half_pel_hv(rows: [&[u8]; 6], out: &mut [u8], w: usize) {
-    // First pass: horizontal filter on each of 6 rows → i32 intermediates
-    // We need w intermediate values per row
-    for i in 0..w {
-        let h0 = fir6(rows[0], i);
-        let h1 = fir6(rows[1], i);
-        let h2 = fir6(rows[2], i);
-        let h3 = fir6(rows[3], i);
-        let h4 = fir6(rows[4], i);
-        let h5 = fir6(rows[5], i);
-        let val = fir6_i32(h0, h1, h2, h3, h4, h5);
-        out[i] = clip_u8((val + 512) >> 10);
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::simd_x86::row_half_pel_hv(rows, out, w);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // First pass: horizontal filter on each of 6 rows → i32 intermediates
+        // We need w intermediate values per row
+        for i in 0..w {
+            let h0 = fir6(rows[0], i);
+            let h1 = fir6(rows[1], i);
+            let h2 = fir6(rows[2], i);
+            let h3 = fir6(rows[3], i);
+            let h4 = fir6(rows[4], i);
+            let h5 = fir6(rows[5], i);
+            let val = fir6_i32(h0, h1, h2, h3, h4, h5);
+            out[i] = clip_u8((val + 512) >> 10);
+        }
     }
 }
 
@@ -560,6 +577,11 @@ fn luma_mc_inner(
             for r in 0..h {
                 let int_row = row(r as isize, 0, w);
                 let src_h = row(r as isize, -2, w + 5);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    crate::simd_x86::row_avg_int_h(int_row, src_h, &mut output[r * w..], w);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 for i in 0..w {
                     let hp = clip_u8((fir6(src_h, i) + 16) >> 5);
                     output[r * w + i] = avg(int_row[i], hp);
@@ -571,6 +593,11 @@ fn luma_mc_inner(
             for r in 0..h {
                 let int_row = row(r as isize, 1, w);
                 let src_h = row(r as isize, -2, w + 5);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    crate::simd_x86::row_avg_h_int(src_h, int_row, &mut output[r * w..], w);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 for i in 0..w {
                     let hp = clip_u8((fir6(src_h, i) + 16) >> 5);
                     output[r * w + i] = avg(hp, int_row[i]);
@@ -586,7 +613,11 @@ fn luma_mc_inner(
                 {
                     neon_row_avg_int_v(int_row, rows, &mut output[r * w..], w);
                 }
-                #[cfg(not(target_arch = "aarch64"))]
+                #[cfg(target_arch = "x86_64")]
+                {
+                    crate::simd_x86::row_avg_int_v(int_row, rows, &mut output[r * w..], w);
+                }
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                 for i in 0..w {
                     let val = rows[0][i] as i32 - 5 * rows[1][i] as i32
                         + 20 * rows[2][i] as i32
@@ -607,7 +638,11 @@ fn luma_mc_inner(
                 {
                     neon_row_avg_int_v(int_row, rows, &mut output[r * w..], w);
                 }
-                #[cfg(not(target_arch = "aarch64"))]
+                #[cfg(target_arch = "x86_64")]
+                {
+                    crate::simd_x86::row_avg_int_v(int_row, rows, &mut output[r * w..], w);
+                }
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                 for i in 0..w {
                     let val = rows[0][i] as i32 - 5 * rows[1][i] as i32
                         + 20 * rows[2][i] as i32
@@ -624,6 +659,11 @@ fn luma_mc_inner(
             for r in 0..h {
                 let src_h = row(r as isize, -2, w + 5);
                 let rows_hv = vrows(-2, r as isize, w + 5);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    crate::simd_x86::row_avg_h_hv(src_h, rows_hv, &mut output[r * w..], w);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 for i in 0..w {
                     let h_val = clip_u8((fir6(src_h, i) + 16) >> 5);
                     let h0 = fir6(rows_hv[0], i);
@@ -642,6 +682,12 @@ fn luma_mc_inner(
             for r in 0..h {
                 let src_h = row(r as isize + 1, -2, w + 5);
                 let rows_hv = vrows(-2, r as isize, w + 5);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    // pavgb is commutative: avg(hv, h) == avg(h, hv)
+                    crate::simd_x86::row_avg_h_hv(src_h, rows_hv, &mut output[r * w..], w);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 for i in 0..w {
                     let hv_val = clip_u8(
                         (fir6_i32(
@@ -664,6 +710,11 @@ fn luma_mc_inner(
             for r in 0..h {
                 let rows_v = vrows(0, r as isize, w);
                 let rows_hv = vrows(-2, r as isize, w + 5);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    crate::simd_x86::row_avg_v_hv(rows_v, rows_hv, &mut output[r * w..], w);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 for i in 0..w {
                     let v_val = clip_u8(
                         (rows_v[0][i] as i32 - 5 * rows_v[1][i] as i32
@@ -694,6 +745,12 @@ fn luma_mc_inner(
             for r in 0..h {
                 let rows_v = vrows(1, r as isize, w);
                 let rows_hv = vrows(-2, r as isize, w + 5);
+                #[cfg(target_arch = "x86_64")]
+                {
+                    // pavgb is commutative: avg(hv, v) == avg(v, hv)
+                    crate::simd_x86::row_avg_v_hv(rows_v, rows_hv, &mut output[r * w..], w);
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 for i in 0..w {
                     let hv_val = clip_u8(
                         (fir6_i32(
@@ -728,7 +785,11 @@ fn luma_mc_inner(
                 {
                     neon_row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
                 }
-                #[cfg(not(target_arch = "aarch64"))]
+                #[cfg(target_arch = "x86_64")]
+                {
+                    crate::simd_x86::row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
+                }
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                 for i in 0..w {
                     let h_val = clip_u8((fir6(src_h, i) + 16) >> 5);
                     let v_val = clip_u8(
@@ -753,7 +814,11 @@ fn luma_mc_inner(
                 {
                     neon_row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
                 }
-                #[cfg(not(target_arch = "aarch64"))]
+                #[cfg(target_arch = "x86_64")]
+                {
+                    crate::simd_x86::row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
+                }
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                 for i in 0..w {
                     let h_val = clip_u8((fir6(src_h, i) + 16) >> 5);
                     let v_val = clip_u8(
@@ -778,7 +843,12 @@ fn luma_mc_inner(
                 {
                     neon_row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
                 }
-                #[cfg(not(target_arch = "aarch64"))]
+                #[cfg(target_arch = "x86_64")]
+                {
+                    // pavgb is commutative: avg(v, h) == avg(h, v)
+                    crate::simd_x86::row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
+                }
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                 for i in 0..w {
                     let v_val = clip_u8(
                         (rows_v[0][i] as i32 - 5 * rows_v[1][i] as i32
@@ -803,7 +873,12 @@ fn luma_mc_inner(
                 {
                     neon_row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
                 }
-                #[cfg(not(target_arch = "aarch64"))]
+                #[cfg(target_arch = "x86_64")]
+                {
+                    // pavgb is commutative: avg(v, h) == avg(h, v)
+                    crate::simd_x86::row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
+                }
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                 for i in 0..w {
                     let v_val = clip_u8(
                         (rows_v[0][i] as i32 - 5 * rows_v[1][i] as i32
@@ -985,7 +1060,13 @@ pub fn chroma_mc(
                 ref_plane, top_off, ref_width, block_w, block_h, output, c00, c01, c10, c11,
             );
         }
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::simd_x86::chroma_bilinear_block(
+                ref_plane, top_off, ref_width, block_w, block_h, output, c00, c01, c10, c11,
+            );
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         for row in 0..block_h {
             let row_top = top_off + row * ref_width;
             let row_bot = row_top + ref_width;
@@ -1022,6 +1103,11 @@ pub fn chroma_mc(
 /// Bi-prediction averaging (spec 8.4.2.3.2).
 /// `output[i] = (pred_l0[i] + pred_l1[i] + 1) >> 1` for each pixel.
 pub fn bi_pred_avg(pred_l0: &[u8], pred_l1: &[u8], output: &mut [u8]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::simd_x86::avg_bytes(pred_l0, pred_l1, output);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
     for (o, (&a, &b)) in output.iter_mut().zip(pred_l0.iter().zip(pred_l1.iter())) {
         *o = ((a as u16 + b as u16 + 1) >> 1) as u8;
     }
@@ -1080,11 +1166,11 @@ pub fn weighted_bi_implicit(pred_l0: &[u8], pred_l1: &[u8], output: &mut [u8], w
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
-    fn make_ref_pic(width: u32, height: u32, y_data: Vec<u8>) -> Rc<DecodedPicture> {
+    fn make_ref_pic(width: u32, height: u32, y_data: Vec<u8>) -> Arc<DecodedPicture> {
         let uv_size = (width / 2 * height / 2) as usize;
-        Rc::new(DecodedPicture {
+        Arc::new(DecodedPicture {
             y: y_data,
             u: vec![128; uv_size],
             v: vec![128; uv_size],

@@ -94,6 +94,19 @@ mod slice;
 
 mod slice_context;
 
+#[cfg(target_arch = "x86_64")]
+mod simd_x86;
+
+/// Force (or re-enable) scalar code paths, process-wide. Used by the
+/// benchmark and test tooling to A/B measure SIMD acceleration; no effect
+/// on architectures without runtime SIMD dispatch.
+pub fn set_force_scalar(force: bool) {
+    #[cfg(target_arch = "x86_64")]
+    simd_x86::set_force_scalar(force);
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = force;
+}
+
 #[cfg(feature = "dev-internals")]
 #[allow(dead_code)]
 pub mod sps;
