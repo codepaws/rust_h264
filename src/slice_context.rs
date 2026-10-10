@@ -944,9 +944,9 @@ impl SliceContext<'_> {
                     }
                 }
                 for r in 0..4 {
-                    for c in 0..4 {
-                        chroma_pred[(cblk_row + r) * 8 + cblk_col + c] = cblk_pred[r * 4 + c];
-                    }
+                    let src = &cblk_pred[r * 4..r * 4 + 4];
+                    let dst = (cblk_row + r) * 8 + cblk_col;
+                    chroma_pred[dst..dst + 4].copy_from_slice(src);
                 }
             }
             let fp = if plane_idx == 0 {
@@ -955,9 +955,9 @@ impl SliceContext<'_> {
                 &mut self.frame.v
             };
             for r in 0..8 {
-                for c in 0..8 {
-                    fp[cbase + r * cstride + cx + c] = chroma_pred[r * 8 + c];
-                }
+                let src = &chroma_pred[r * 8..r * 8 + 8];
+                let dst = cbase + r * cstride + cx;
+                fp[dst..dst + 8].copy_from_slice(src);
             }
         }
         self.mb_is_direct[mb_idx] = true;
