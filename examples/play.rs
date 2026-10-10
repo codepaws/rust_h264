@@ -139,7 +139,10 @@ unsafe fn avx2_yuv_to_argb(
             let yv = _mm256_cvtepu8_epi32(_mm_loadl_epi64(y_row.add(col) as *const __m128i));
             // Pair-duplicate 4 chroma samples to 8 lanes.
             let dup = |p: *const u8| {
-                let c4 = _mm_cvtepu8_epi32(_mm_loadl_epi64(p.add(col / 2) as *const __m128i));
+                // Eight luma pixels consume exactly four chroma bytes. An
+                // eight-byte load can cross the end of a tightly sized plane.
+                let samples = std::ptr::read_unaligned(p.add(col / 2).cast::<i32>());
+                let c4 = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(samples));
                 let lo = _mm_unpacklo_epi32(c4, c4);
                 let hi4 = _mm_unpackhi_epi32(c4, c4);
                 _mm256_set_m128i(hi4, lo)
@@ -189,6 +192,92 @@ unsafe fn avx2_yuv_to_argb(
             let b = (y_val + ((u_val * 454 + 128) >> 8)).clamp(0, 255) as u32;
             *out_row.add(col) = (r << 16) | (g << 8) | b;
             col += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn avx2_matches_scalar_with_tight_planes() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for width in [8, 10, 12, 14, 16] {
+            for height in [2, 16] {
+                let y: Vec<_> = (0..width * height).map(|i| (i * 37) as u8).collect();
+                let u: Vec<_> = (0..width * height / 4).map(|i| (i * 53) as u8).collect();
+                let v: Vec<_> = (0..width * height / 4).map(|i| (255 - i % 256) as u8).collect();
+                let mut expected = vec![0; y.len()];
+                let mut actual = expected.clone();
+                scalar_yuv_to_argb(&y, &u, &v, width, height, &mut expected);
+                unsafe { avx2_yuv_to_argb(&y, &u, &v, width, height, &mut actual) };
+                assert_eq!(actual, expected, "{width}x{height}");
+            }
+        }
+    }
+
+    // Run in a child so an invalid SIMD load becomes a test failure rather
+    // than terminating the entire test harness. The chroma plane ends exactly
+    // at the boundary of committed memory, followed by an inaccessible page.
+    #[test]
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    fn avx2_chroma_guard_page() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        const CHILD: &str = "RUST_H264_CHROMA_GUARD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::avx2_chroma_guard_page", "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "guarded chroma conversion failed: {status}");
+            return;
+        }
+
+        use std::ffi::c_void;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetErrorMode(mode: u32) -> u32;
+            fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
+            fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
+        }
+        struct GuardedPlane(*mut c_void);
+        impl Drop for GuardedPlane {
+            fn drop(&mut self) {
+                unsafe { VirtualFree(self.0, 0, 0x8000); }
+            }
+        }
+        unsafe {
+            // Suppress Windows Error Reporting UI in the crashing regression child.
+            SetErrorMode(0x0002);
+            // Reserve two allocation-granularity units, commit only the first.
+            const REGION: usize = 65536;
+            let base = VirtualAlloc(std::ptr::null_mut(), REGION * 2, 0x2000, 0x01);
+            assert!(!base.is_null());
+            let _allocation = GuardedPlane(base);
+            assert_eq!(VirtualAlloc(base, REGION, 0x1000, 0x04), base);
+            for width in [8, 10, 12, 14, 16] {
+                for height in [2, 16] {
+                    let len = width * height / 4;
+                    let ptr = base.cast::<u8>().add(REGION - len);
+                    for i in 0..len {
+                        ptr.add(i).write((i * 53) as u8);
+                    }
+                    let chroma = std::slice::from_raw_parts(ptr, len);
+                    let y = vec![127; width * height];
+                    let mut expected = vec![0; y.len()];
+                    let mut actual = expected.clone();
+                    scalar_yuv_to_argb(&y, chroma, chroma, width, height, &mut expected);
+                    avx2_yuv_to_argb(&y, chroma, chroma, width, height, &mut actual);
+                    assert_eq!(actual, expected, "{width}x{height}");
+                }
+            }
         }
     }
 }
