@@ -264,6 +264,13 @@ pub(crate) fn row_half_pel_h(src: &[u8], out: &mut [u8], w: usize) {
         scalar_row_half_pel_h(src, out, w);
         return;
     }
+    unsafe { row_half_pel_h_simd(src, out, w) };
+}
+
+/// Unchecked SIMD body of [`row_half_pel_h`] — callers must have resolved
+/// the level once (frame/block-dispatched) and hold the SSE2 baseline.
+#[inline(always)]
+pub(crate) unsafe fn row_half_pel_h_simd(src: &[u8], out: &mut [u8], w: usize) {
     let mut i = 0;
     unsafe {
         while i + 16 <= w {
@@ -304,6 +311,12 @@ pub(crate) fn row_half_pel_v(rows: [&[u8]; 6], out: &mut [u8], w: usize) {
         scalar_row_half_pel_v(rows, out, w);
         return;
     }
+    unsafe { row_half_pel_v_simd(rows, out, w) };
+}
+
+/// Unchecked SIMD body of [`row_half_pel_v`] (see `row_half_pel_h_simd`).
+#[inline(always)]
+pub(crate) unsafe fn row_half_pel_v_simd(rows: [&[u8]; 6], out: &mut [u8], w: usize) {
     let mut i = 0;
     unsafe {
         while i + 16 <= w {
@@ -339,6 +352,12 @@ pub(crate) fn row_half_pel_hv(rows: [&[u8]; 6], out: &mut [u8], w: usize) {
         scalar_row_half_pel_hv(rows, out, w);
         return;
     }
+    unsafe { row_half_pel_hv_simd(rows, out, w) };
+}
+
+/// Unchecked SIMD body of [`row_half_pel_hv`] (see `row_half_pel_h_simd`).
+#[inline(always)]
+pub(crate) unsafe fn row_half_pel_hv_simd(rows: [&[u8]; 6], out: &mut [u8], w: usize) {
     let mut i = 0;
     unsafe {
         while i + 8 <= w {

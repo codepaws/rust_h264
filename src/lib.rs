@@ -108,6 +108,18 @@ pub fn set_force_scalar(force: bool) {
     let _ = force;
 }
 
+/// Crate-internal SIMD availability for block-dispatched paths (one check
+/// per call site instead of per-row checks inside kernels).
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn simd_enabled() -> bool {
+    simd_x86::level() != simd_x86::SimdLevel::Scalar
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) fn simd_enabled() -> bool {
+    false
+}
+
 /// Nanoseconds spent inside the deblocking filter so far this process —
 /// for profiling the filter's share of decode time (see `bench_decode`).
 pub fn deblock_ns() -> u64 {

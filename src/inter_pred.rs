@@ -521,7 +521,10 @@ fn luma_mc_dispatch(
 
     if in_bounds {
         // Fast path: entire block + filter margins are in bounds
-        // Access reference buffer directly without per-pixel clamping
+        // Access reference buffer directly without per-pixel clamping.
+        // Block-dispatched SIMD decision: one level check here instead of
+        // per-row checks inside the kernels.
+        let simd = crate::simd_enabled();
         luma_mc_inner(
             ref_y,
             stride,
@@ -533,6 +536,7 @@ fn luma_mc_dispatch(
             frac_y,
             output,
             out_stride,
+            simd,
         );
     } else if field_fallback {
         // Field-coded boundary fallback: extract field lines into a temporary
@@ -601,6 +605,10 @@ fn luma_mc_dispatch(
 /// `ow` is the destination row stride: rows are written `ow` apart with `w`
 /// valid bytes each. Packed callers pass `ow == w`; the fused skip-MB path
 /// passes the frame's luma stride so MC writes directly into the plane.
+///
+/// `simd` is the block-dispatched SIMD decision: the caller resolves the
+/// CPU level once per block (frame-dispatched MC) so the row kernels skip
+/// their per-row level checks on the hot path.
 #[allow(clippy::too_many_arguments)]
 fn luma_mc_inner(
     ref_y: &[u8],
@@ -613,6 +621,7 @@ fn luma_mc_inner(
     frac_y: i32,
     output: &mut [u8],
     ow: usize,
+    simd: bool,
 ) {
     if ow < w || (h > 0 && (h - 1) * ow + w > output.len()) {
         return;
@@ -645,6 +654,16 @@ fn luma_mc_inner(
         }
         (2, 0) => {
             // Half-pel horizontal
+            #[cfg(target_arch = "x86_64")]
+            if simd {
+                for r in 0..h {
+                    let src = row(r as isize, -2, w + 5);
+                    unsafe {
+                        crate::simd_x86::row_half_pel_h_simd(src, &mut output[r * ow..], w)
+                    };
+                }
+                return;
+            }
             for r in 0..h {
                 let src = row(r as isize, -2, w + 5);
                 row_half_pel_h(src, &mut output[r * ow..], w);
@@ -652,6 +671,14 @@ fn luma_mc_inner(
         }
         (0, 2) => {
             // Half-pel vertical
+            #[cfg(target_arch = "x86_64")]
+            if simd {
+                for r in 0..h {
+                    let rows = vrows(0, r as isize, w);
+                    unsafe { crate::simd_x86::row_half_pel_v_simd(rows, &mut output[r * ow..], w) };
+                }
+                return;
+            }
             for r in 0..h {
                 let rows = vrows(0, r as isize, w);
                 row_half_pel_v(rows, &mut output[r * ow..], w);
@@ -659,6 +686,16 @@ fn luma_mc_inner(
         }
         (2, 2) => {
             // Half-pel diagonal
+            #[cfg(target_arch = "x86_64")]
+            if simd {
+                for r in 0..h {
+                    let rows = vrows(-2, r as isize, w + 5);
+                    unsafe {
+                        crate::simd_x86::row_half_pel_hv_simd(rows, &mut output[r * ow..], w)
+                    };
+                }
+                return;
+            }
             for r in 0..h {
                 let rows = vrows(-2, r as isize, w + 5);
                 row_half_pel_hv(rows, &mut output[r * ow..], w);
