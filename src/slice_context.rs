@@ -394,27 +394,43 @@ impl SliceContext<'_> {
         if let Some(ref_pic) = ref_pic_list.first() {
             let (mc_y, ref_stride, ref_y_off, mc_cy, c_ref_stride, c_ref_off) =
                 self.mc_params(mb_idx, mb_y, ref_pic.width as usize, 0i8);
-            // Luma MC
-            let mut luma_pred = [0u8; 256];
-            inter_pred::luma_mc_stride(
-                ref_pic,
-                mb_x as i32,
-                mc_y,
-                mvp_x as i32,
-                mvp_y as i32,
-                16,
-                16,
-                &mut luma_pred,
-                ref_stride,
-                ref_y_off,
-            );
+            // Luma MC — fused when unweighted: writes directly into the
+            // frame plane (strided destination), no 256-byte buffer + copy.
             if use_weight == 1 {
+                let mut luma_pred = [0u8; 256];
+                inter_pred::luma_mc_stride(
+                    ref_pic,
+                    mb_x as i32,
+                    mc_y,
+                    mvp_x as i32,
+                    mvp_y as i32,
+                    16,
+                    16,
+                    &mut luma_pred,
+                    ref_stride,
+                    ref_y_off,
+                );
                 wctx.apply_uni(&mut luma_pred, 0, 0, false, 0);
-            }
-            for r in 0..16 {
-                let src = &luma_pred[r * 16..r * 16 + 16];
-                let dst_off = self.ly_offset + r * self.ly_stride + mb_x;
-                self.frame.y[dst_off..dst_off + 16].copy_from_slice(src);
+                for r in 0..16 {
+                    let src = &luma_pred[r * 16..r * 16 + 16];
+                    let dst_off = self.ly_offset + r * self.ly_stride + mb_x;
+                    self.frame.y[dst_off..dst_off + 16].copy_from_slice(src);
+                }
+            } else {
+                let y_dst = &mut self.frame.y[self.ly_offset + mb_x..];
+                inter_pred::luma_mc_strided(
+                    ref_pic,
+                    mb_x as i32,
+                    mc_y,
+                    mvp_x as i32,
+                    mvp_y as i32,
+                    16,
+                    16,
+                    y_dst,
+                    self.ly_stride,
+                    ref_stride,
+                    ref_y_off,
+                );
             }
             // Chroma MC — fused: writes directly into the frame planes
             // (strided destination), no intermediate 64-byte buffers.
