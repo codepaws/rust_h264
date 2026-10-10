@@ -70,22 +70,15 @@ fn yuv_to_argb(
 ) {
     argb.clear();
     argb.resize(width * height, 0);
-    static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let avx2 = *AVX2.get_or_init(|| {
-        #[cfg(target_arch = "x86_64")]
-        {
-            std::arch::is_x86_feature_detected!("avx2")
+    #[cfg(target_arch = "x86_64")]
+    {
+        static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *AVX2.get_or_init(|| std::arch::is_x86_feature_detected!("avx2")) {
+            unsafe { avx2_yuv_to_argb(y, u, v, width, height, argb) }
+            return;
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            false
-        }
-    });
-    if avx2 {
-        unsafe { avx2_yuv_to_argb(y, u, v, width, height, argb) }
-    } else {
-        scalar_yuv_to_argb(y, u, v, width, height, argb)
     }
+    scalar_yuv_to_argb(y, u, v, width, height, argb)
 }
 
 fn scalar_yuv_to_argb(
