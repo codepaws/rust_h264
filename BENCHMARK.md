@@ -440,6 +440,21 @@ P-only case remains slower than 1 thread.)
   the `OFFSET_TO_BLOCK` optimizations. The single-thread priority is
   unambiguous: **motion compensation** — block-fused, frame-dispatched
   kernels (one `#[target_feature]` function per frame doing whole-MB
+- **MC plumbing results** (commits d0ba040..4b1fc98: strided-destination
+  luma/chroma MC writing directly into frame planes for P_Skip and
+  B_Skip uni-pred blocks, per-pixel copy loops and residual-add loops
+  hoisted to row copies, and all luma MC kernels block-dispatched —
+  the CPU level resolved once per block instead of per row): 4
+  interleaved rounds under partial machine load (averages, noisy):
+  **720p P-only 216->229 fps (+6.1%), 1080p B 59->61 (+3.6%), 720p B a
+  wash (-0.1%)** — earlier less-contended runs of the same range had
+  shown up to +18% on 720p B, so the B number here is contention
+  noise, not a regression verdict. Cumulative single-thread progress
+  across the whole MC campaign from the 64/157/234 baseline: **69/182/
+  260 fps on the quiet-machine runs** (~8-16%), with the quiet-window
+  band to be re-confirmed alongside the whole-MB fusion work. The
+  remaining MC cost is inside the kernels and whole-MB structure, not
+  the plumbing — that is the frame-dispatched endgame still queued.
   MC, no per-block calls), not further filter work. Per-block timing
   was reverted after measurement (~100k MC calls/frame make timer
   overhead exceed the work being measured); only the cheap
