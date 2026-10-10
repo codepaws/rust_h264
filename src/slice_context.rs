@@ -416,7 +416,8 @@ impl SliceContext<'_> {
                 let dst_off = self.ly_offset + r * self.ly_stride + mb_x;
                 self.frame.y[dst_off..dst_off + 16].copy_from_slice(src);
             }
-            // Chroma MC
+            // Chroma MC — fused: writes directly into the frame planes
+            // (strided destination), no intermediate 64-byte buffers.
             let cw = c_ref_stride;
             let cx = mb_x / 2;
             let cy = mc_cy;
@@ -425,42 +426,73 @@ impl SliceContext<'_> {
             // Field picture chroma MV offset for opposite-parity reference
             let chroma_mv_y_offset = self.chroma_field_mv_offset(ref_pic);
             let cmv_y = mvp_y as i32 + chroma_mv_y_offset;
-            let mut cb_pred = [0u8; 64];
-            let mut cr_pred = [0u8; 64];
-            inter_pred::chroma_mc(
-                &ref_pic.u[c_ref_off..],
-                cw,
-                (self.height / 2) as usize,
-                cx as i32,
-                cy as i32,
-                mvp_x as i32,
-                cmv_y,
-                8,
-                8,
-                &mut cb_pred,
-            );
-            inter_pred::chroma_mc(
-                &ref_pic.v[c_ref_off..],
-                cw,
-                (self.height / 2) as usize,
-                cx as i32,
-                cy as i32,
-                mvp_x as i32,
-                cmv_y,
-                8,
-                8,
-                &mut cr_pred,
-            );
             if use_weight == 1 {
+                // Weighted prediction needs packed buffers to filter before
+                // storing; keep the buffered path for this rarer case.
+                let mut cb_pred = [0u8; 64];
+                let mut cr_pred = [0u8; 64];
+                inter_pred::chroma_mc(
+                    &ref_pic.u[c_ref_off..],
+                    cw,
+                    (self.height / 2) as usize,
+                    cx as i32,
+                    cy as i32,
+                    mvp_x as i32,
+                    cmv_y,
+                    8,
+                    8,
+                    &mut cb_pred,
+                );
+                inter_pred::chroma_mc(
+                    &ref_pic.v[c_ref_off..],
+                    cw,
+                    (self.height / 2) as usize,
+                    cx as i32,
+                    cy as i32,
+                    mvp_x as i32,
+                    cmv_y,
+                    8,
+                    8,
+                    &mut cr_pred,
+                );
                 wctx.apply_uni(&mut cb_pred, 0, 0, true, 0);
                 wctx.apply_uni(&mut cr_pred, 0, 0, true, 1);
-            }
-            for r in 0..8 {
-                let (s1, s2) = (&cb_pred[r * 8..r * 8 + 8], &cr_pred[r * 8..r * 8 + 8]);
-                let o1 = cbase + r * cstride + cx;
-                let o2 = cbase + r * cstride + cx;
-                self.frame.u[o1..o1 + 8].copy_from_slice(s1);
-                self.frame.v[o2..o2 + 8].copy_from_slice(s2);
+                for r in 0..8 {
+                    let (s1, s2) = (&cb_pred[r * 8..r * 8 + 8], &cr_pred[r * 8..r * 8 + 8]);
+                    let o1 = cbase + r * cstride + cx;
+                    let o2 = cbase + r * cstride + cx;
+                    self.frame.u[o1..o1 + 8].copy_from_slice(s1);
+                    self.frame.v[o2..o2 + 8].copy_from_slice(s2);
+                }
+            } else {
+                let u_dst = &mut self.frame.u[cbase + cx..];
+                let v_dst = &mut self.frame.v[cbase + cx..];
+                inter_pred::chroma_mc_strided(
+                    &ref_pic.u[c_ref_off..],
+                    cw,
+                    (self.height / 2) as usize,
+                    cx as i32,
+                    cy as i32,
+                    mvp_x as i32,
+                    cmv_y,
+                    8,
+                    8,
+                    u_dst,
+                    cstride,
+                );
+                inter_pred::chroma_mc_strided(
+                    &ref_pic.v[c_ref_off..],
+                    cw,
+                    (self.height / 2) as usize,
+                    cx as i32,
+                    cy as i32,
+                    mvp_x as i32,
+                    cmv_y,
+                    8,
+                    8,
+                    v_dst,
+                    cstride,
+                );
             }
         }
         // Store MVs and ref indices

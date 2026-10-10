@@ -975,6 +975,98 @@ fn neon_chroma_bilinear_block(
     }
 }
 
+/// Chroma MC with a destination row stride: identical math to
+/// [`chroma_mc`], but output rows are written `out_stride` apart instead of
+/// packed, so the destination can be the frame's chroma plane directly
+/// (fused path — no intermediate block buffer + copy). The NEON/SSE2 block
+/// kernels write packed output, so the strided variant stages each block
+/// row through a small stack buffer; the full-pel and boundary paths write
+/// rows directly.
+#[allow(clippy::too_many_arguments)]
+pub fn chroma_mc_strided(
+    ref_plane: &[u8],
+    ref_width: usize,
+    ref_height: usize,
+    x: i32,
+    y: i32,
+    dx: i32,
+    dy: i32,
+    block_w: usize,
+    block_h: usize,
+    output: &mut [u8],
+    out_stride: usize,
+) {
+    if block_w == 0 || block_h == 0 || out_stride < block_w || block_w > 16 {
+        return;
+    }
+    if (block_h - 1) * out_stride + block_w > output.len() {
+        return;
+    }
+    let frac_x = dx.rem_euclid(8);
+    let frac_y = dy.rem_euclid(8);
+    let x_int = x + (dx >> 3);
+    let y_int = y + (dy >> 3);
+
+    // Full-pel: copy source rows straight to strided destinations.
+    if frac_x == 0 && frac_y == 0 {
+        let w = ref_width as i32;
+        let h = ref_height as i32;
+        if x_int >= 0
+            && y_int >= 0
+            && x_int + block_w as i32 <= w
+            && y_int + block_h as i32 <= h
+            && (y_int as usize + block_h) * ref_width <= ref_plane.len()
+        {
+            let mut src_off = y_int as usize * ref_width + x_int as usize;
+            for row in 0..block_h {
+                if src_off + block_w > ref_plane.len() {
+                    return;
+                }
+                let dst = row * out_stride;
+                output[dst..dst + block_w]
+                    .copy_from_slice(&ref_plane[src_off..src_off + block_w]);
+                src_off += ref_width;
+            }
+        } else {
+            for row in 0..block_h {
+                for col in 0..block_w {
+                    let v = ref_chroma(
+                        ref_plane,
+                        ref_width,
+                        ref_height,
+                        x_int + col as i32,
+                        y_int + row as i32,
+                    ) as u8;
+                    output[row * out_stride + col] = v;
+                }
+            }
+        }
+        return;
+    }
+
+    // Fractional positions: reuse the packed kernel per block (bit-exact
+    // NEON/SSE2 paths included) and store rows strided. The staging buffer
+    // replaces the old caller-side 64-byte plane buffer + copy.
+    let mut packed = [0u8; 256];
+    chroma_mc(
+        ref_plane,
+        ref_width,
+        ref_height,
+        x,
+        y,
+        dx,
+        dy,
+        block_w,
+        block_h,
+        &mut packed,
+    );
+    for row in 0..block_h {
+        let dst = row * out_stride;
+        output[dst..dst + block_w]
+            .copy_from_slice(&packed[row * block_w..(row + 1) * block_w]);
+    }
+}
+
 /// Perform chroma motion compensation for one plane (U or V).
 ///
 /// Chroma MVs use the same quarter-pel values as luma, but since chroma is
