@@ -762,6 +762,20 @@ pub(crate) fn prepare_slice_job<P: crate::dpb::PicRef>(
         {
             return Err(DecodeError::from("unsupported slice type"));
         }
+        // An SPS update cannot turn a continuation into a new picture. Reject
+        // incompatible geometry before consuming pending state or changing POC;
+        // the threaded coordinator must retain the open picture's sequence.
+        let slice_height = sps.height() / if header.field_pic_flag { 2 } else { 1 };
+        if header.first_mb_in_slice > 0
+            && pending.as_ref().is_some_and(|ps| {
+                ps.mb_width != sps.width().div_ceil(16)
+                    || ps.mb_height != slice_height.div_ceil(16)
+            })
+        {
+            return Err(DecodeError::InvalidSyntax(
+                "continuation slice is incompatible with the open picture",
+            ));
+        }
         let is_field_pic = header.field_pic_flag;
         let is_p_slice = header.slice_type == SliceType::P;
         let is_b_slice = header.slice_type == SliceType::B;

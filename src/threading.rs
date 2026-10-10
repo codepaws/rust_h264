@@ -876,4 +876,133 @@ mod tests {
             compare_threaded(&stream, 4);
         }
     }
+
+    // Small self-contained Baseline streams keep this regression independent
+    // of the external corpus and avoid reference-picture dependencies.
+    fn sequence_test_nal(kind: NalUnitType, bits: &str) -> NalUnit<'static> {
+        let mut bits = bits.to_owned();
+        bits.push('1'); // rbsp_stop_one_bit
+        while bits.len() % 8 != 0 {
+            bits.push('0');
+        }
+        let rbsp = bits
+            .as_bytes()
+            .chunks(8)
+            .map(|byte| byte.iter().fold(0u8, |v, &bit| (v << 1) | (bit - b'0')))
+            .collect::<Vec<_>>();
+        NalUnit {
+            nal_ref_idc: 0,
+            nal_unit_type: kind,
+            rbsp: rbsp.into(),
+        }
+    }
+
+    fn sequence_test_ue(value: u32) -> String {
+        let suffix = format!("{:b}", value + 1);
+        format!("{}{}", "0".repeat(suffix.len() - 1), suffix)
+    }
+
+    fn sequence_test_sps(mb_width: u32, mb_height: u32) -> NalUnit<'static> {
+        // Baseline, level 1, SPS 0, four-bit frame_num, POC type 2,
+        // one reference, progressive frame, no cropping/VUI.
+        sequence_test_nal(
+            NalUnitType::Sps,
+            &format!(
+                "010000100000000000001010110110100{}{}1100",
+                sequence_test_ue(mb_width - 1),
+                sequence_test_ue(mb_height - 1)
+            ),
+        )
+    }
+
+    fn sequence_test_slice(first_mb: u32, count: usize, sample: u8) -> NalUnit<'static> {
+        // Non-reference I slice, PPS 0, frame_num 0, QP delta 0,
+        // deblocking disabled. Each macroblock is I_PCM.
+        let mut bits = format!("{}011100001010", sequence_test_ue(first_mb));
+        for _ in 0..count {
+            bits.push_str(&sequence_test_ue(25));
+            while bits.len() % 8 != 0 {
+                bits.push('0');
+            }
+            bits.push_str(&format!("{sample:08b}").repeat(384));
+        }
+        sequence_test_nal(NalUnitType::Slice, &bits)
+    }
+
+    #[test]
+    fn incompatible_continuation_preserves_sequence_progress() {
+        let sps = sequence_test_sps(2, 1);
+        let changed_sps = sequence_test_sps(3, 1);
+        let reshaped_sps = sequence_test_sps(1, 2);
+        assert_eq!(parse_sps(&sps.rbsp).unwrap().width(), 32);
+        assert_eq!(parse_sps(&changed_sps.rbsp).unwrap().width(), 48);
+        let pps = sequence_test_nal(NalUnitType::Pps, "1100111000111100");
+        let first = sequence_test_slice(0, 1, 61);
+        let continuation = sequence_test_slice(1, 1, 93);
+        let full = sequence_test_slice(0, 2, 117);
+        let mut decoder = ThreadedDecoder::new(1);
+        let mut serial = crate::decoder::OrderedDecoder::new();
+        for nal in [&sps, &pps, &first] {
+            serial.decode_nal(nal).unwrap();
+        }
+        decoder.decode_nal(&sps).unwrap();
+        decoder.decode_nal(&pps).unwrap();
+        decoder.decode_nal(&first).unwrap();
+        for incompatible in [&changed_sps, &reshaped_sps] {
+            decoder.decode_nal(incompatible).unwrap();
+            serial.decode_nal(incompatible).unwrap();
+            let result = decoder.decode_nal(&continuation);
+            assert!(
+                matches!(
+                    result,
+                    Err(DecodeError::InvalidSyntax(
+                        "continuation slice is incompatible with the open picture"
+                    ))
+                ),
+                "result={result:?}, next_seq={}, open_seq={:?}",
+                decoder.next_seq,
+                decoder.open.as_ref().map(|p| p.seq)
+            );
+            // Serial recovery absorbs continuation errors while preserving pending.
+            assert!(serial.decode_nal(&continuation).unwrap().is_empty());
+        }
+        assert_eq!(decoder.next_seq, 1);
+        assert_eq!(decoder.open.as_ref().unwrap().seq, 0);
+        assert_eq!(decoder.open_slices.len(), 1);
+
+        // Restore the SPS and finish the original picture, then feed enough
+        // pictures to expose a missing terminal result as growing storage.
+        decoder.decode_nal(&sps).unwrap();
+        decoder.decode_nal(&continuation).unwrap();
+        serial.decode_nal(&sps).unwrap();
+        serial.decode_nal(&continuation).unwrap();
+        let mut expected = Vec::new();
+        let mut frames = Vec::new();
+        for _ in 0..64 {
+            frames.extend(decoder.decode_nal(&full).unwrap());
+            expected.extend(serial.decode_nal(&full).unwrap());
+            assert!(decoder.completed.len() <= 1);
+            assert!(decoder.slots.len() <= 2);
+        }
+        frames.extend(decoder.flush());
+        expected.extend(serial.flush());
+        assert_eq!(frames.len(), expected.len());
+        for (actual, expected) in frames.iter().zip(&expected) {
+            assert_eq!(actual.y, expected.y);
+            assert_eq!(actual.u, expected.u);
+            assert_eq!(actual.v, expected.v);
+            assert_eq!(actual.pic_order_cnt, expected.pic_order_cnt);
+        }
+        assert_eq!(frames.len(), 65);
+        assert_eq!(frames[0].y[0], 61);
+        assert_eq!(frames[0].y[16], 93);
+        assert!(frames[1..]
+            .iter()
+            .all(|frame| frame.y.iter().all(|&v| v == 117)));
+        assert_eq!(decoder.commit_next, decoder.next_seq);
+        assert_eq!(decoder.decoded_frames(), 65);
+        assert!(decoder.completed.is_empty());
+        assert!(decoder.slots.is_empty());
+        assert!(decoder.flush().is_empty());
+    }
 }
