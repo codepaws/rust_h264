@@ -708,7 +708,7 @@ fn luma_mc_inner(
                 let src_h = row(r as isize, -2, w + 5);
                 #[cfg(target_arch = "x86_64")]
                 {
-                    crate::simd_x86::row_avg_int_h(int_row, src_h, &mut output[r * ow..], w);
+                    crate::simd_x86::row_avg_int_h(int_row, src_h, &mut output[r * ow..], w, simd);
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 for i in 0..w {
@@ -724,7 +724,7 @@ fn luma_mc_inner(
                 let src_h = row(r as isize, -2, w + 5);
                 #[cfg(target_arch = "x86_64")]
                 {
-                    crate::simd_x86::row_avg_h_int(src_h, int_row, &mut output[r * ow..], w);
+                    crate::simd_x86::row_avg_h_int(src_h, int_row, &mut output[r * ow..], w, simd);
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 for i in 0..w {
@@ -744,7 +744,7 @@ fn luma_mc_inner(
                 }
                 #[cfg(target_arch = "x86_64")]
                 {
-                    crate::simd_x86::row_avg_int_v(int_row, rows, &mut output[r * ow..], w);
+                    crate::simd_x86::row_avg_int_v(int_row, rows, &mut output[r * ow..], w, simd);
                 }
                 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                 for i in 0..w {
@@ -769,7 +769,7 @@ fn luma_mc_inner(
                 }
                 #[cfg(target_arch = "x86_64")]
                 {
-                    crate::simd_x86::row_avg_int_v(int_row, rows, &mut output[r * ow..], w);
+                    crate::simd_x86::row_avg_int_v(int_row, rows, &mut output[r * ow..], w, simd);
                 }
                 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                 for i in 0..w {
@@ -790,7 +790,7 @@ fn luma_mc_inner(
                 let rows_hv = vrows(-2, r as isize, w + 5);
                 #[cfg(target_arch = "x86_64")]
                 {
-                    crate::simd_x86::row_avg_h_hv(src_h, rows_hv, &mut output[r * ow..], w);
+                    crate::simd_x86::row_avg_h_hv(src_h, rows_hv, &mut output[r * ow..], w, simd);
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 for i in 0..w {
@@ -814,7 +814,7 @@ fn luma_mc_inner(
                 #[cfg(target_arch = "x86_64")]
                 {
                     // pavgb is commutative: avg(hv, h) == avg(h, hv)
-                    crate::simd_x86::row_avg_h_hv(src_h, rows_hv, &mut output[r * ow..], w);
+                    crate::simd_x86::row_avg_h_hv(src_h, rows_hv, &mut output[r * ow..], w, simd);
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 for i in 0..w {
@@ -841,7 +841,7 @@ fn luma_mc_inner(
                 let rows_hv = vrows(-2, r as isize, w + 5);
                 #[cfg(target_arch = "x86_64")]
                 {
-                    crate::simd_x86::row_avg_v_hv(rows_v, rows_hv, &mut output[r * ow..], w);
+                    crate::simd_x86::row_avg_v_hv(rows_v, rows_hv, &mut output[r * ow..], w, simd);
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 for i in 0..w {
@@ -877,7 +877,7 @@ fn luma_mc_inner(
                 #[cfg(target_arch = "x86_64")]
                 {
                     // pavgb is commutative: avg(hv, v) == avg(v, hv)
-                    crate::simd_x86::row_avg_v_hv(rows_v, rows_hv, &mut output[r * ow..], w);
+                    crate::simd_x86::row_avg_v_hv(rows_v, rows_hv, &mut output[r * ow..], w, simd);
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 for i in 0..w {
@@ -916,7 +916,7 @@ fn luma_mc_inner(
                 }
                 #[cfg(target_arch = "x86_64")]
                 {
-                    crate::simd_x86::row_avg_h_v(src_h, rows_v, &mut output[r * ow..], w);
+                    crate::simd_x86::row_avg_h_v(src_h, rows_v, &mut output[r * ow..], w, simd);
                 }
                 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                 for i in 0..w {
@@ -945,7 +945,7 @@ fn luma_mc_inner(
                 }
                 #[cfg(target_arch = "x86_64")]
                 {
-                    crate::simd_x86::row_avg_h_v(src_h, rows_v, &mut output[r * ow..], w);
+                    crate::simd_x86::row_avg_h_v(src_h, rows_v, &mut output[r * ow..], w, simd);
                 }
                 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                 for i in 0..w {
@@ -975,7 +975,7 @@ fn luma_mc_inner(
                 #[cfg(target_arch = "x86_64")]
                 {
                     // pavgb is commutative: avg(v, h) == avg(h, v)
-                    crate::simd_x86::row_avg_h_v(src_h, rows_v, &mut output[r * ow..], w);
+                    crate::simd_x86::row_avg_h_v(src_h, rows_v, &mut output[r * ow..], w, simd);
                 }
                 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                 for i in 0..w {
@@ -1005,7 +1005,7 @@ fn luma_mc_inner(
                 #[cfg(target_arch = "x86_64")]
                 {
                     // pavgb is commutative: avg(v, h) == avg(h, v)
-                    crate::simd_x86::row_avg_h_v(src_h, rows_v, &mut output[r * ow..], w);
+                    crate::simd_x86::row_avg_h_v(src_h, rows_v, &mut output[r * ow..], w, simd);
                 }
                 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                 for i in 0..w {

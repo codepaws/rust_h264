@@ -380,8 +380,8 @@ pub(crate) unsafe fn row_half_pel_hv_simd(rows: [&[u8]; 6], out: &mut [u8], w: u
 
 /// Quarter-pel: `avg(integer_row, h_half_pel)` — arms (1,0).
 #[inline(never)]
-pub(crate) fn row_avg_int_h(int_row: &[u8], src_h: &[u8], out: &mut [u8], w: usize) {
-    if level() == SimdLevel::Scalar {
+pub(crate) fn row_avg_int_h(int_row: &[u8], src_h: &[u8], out: &mut [u8], w: usize, simd: bool) {
+    if !simd {
         for i in 0..w {
             let hp = clip_u8((fir6_scalar(src_h, i) + 16) >> 5);
             out[i] = avg_scalar(int_row[i], hp);
@@ -406,8 +406,8 @@ pub(crate) fn row_avg_int_h(int_row: &[u8], src_h: &[u8], out: &mut [u8], w: usi
 
 /// Quarter-pel: `avg(h_half_pel, integer_row)` — arm (3,0) (integer row at +1).
 #[inline(never)]
-pub(crate) fn row_avg_h_int(src_h: &[u8], int_row: &[u8], out: &mut [u8], w: usize) {
-    if level() == SimdLevel::Scalar {
+pub(crate) fn row_avg_h_int(src_h: &[u8], int_row: &[u8], out: &mut [u8], w: usize, simd: bool) {
+    if !simd {
         for i in 0..w {
             let hp = clip_u8((fir6_scalar(src_h, i) + 16) >> 5);
             out[i] = avg_scalar(hp, int_row[i]);
@@ -432,8 +432,14 @@ pub(crate) fn row_avg_h_int(src_h: &[u8], int_row: &[u8], out: &mut [u8], w: usi
 
 /// Quarter-pel: `avg(integer_row, v_half_pel)` — arms (0,1) and (0,3).
 #[inline(never)]
-pub(crate) fn row_avg_int_v(int_row: &[u8], rows: [&[u8]; 6], out: &mut [u8], w: usize) {
-    if level() == SimdLevel::Scalar {
+pub(crate) fn row_avg_int_v(
+    int_row: &[u8],
+    rows: [&[u8]; 6],
+    out: &mut [u8],
+    w: usize,
+    simd: bool,
+) {
+    if !simd {
         for i in 0..w {
             let hp = clip_u8((fir6_v_scalar(rows, i) + 16) >> 5);
             out[i] = avg_scalar(int_row[i], hp);
@@ -458,8 +464,14 @@ pub(crate) fn row_avg_int_v(int_row: &[u8], rows: [&[u8]; 6], out: &mut [u8], w:
 
 /// Quarter-pel: `avg(h_half_pel, v_half_pel)` — arms (1,1), (3,1), (1,3), (3,3).
 #[inline(never)]
-pub(crate) fn row_avg_h_v(src_h: &[u8], rows_v: [&[u8]; 6], out: &mut [u8], w: usize) {
-    if level() == SimdLevel::Scalar {
+pub(crate) fn row_avg_h_v(
+    src_h: &[u8],
+    rows_v: [&[u8]; 6],
+    out: &mut [u8],
+    w: usize,
+    simd: bool,
+) {
+    if !simd {
         for i in 0..w {
             let hp = clip_u8((fir6_scalar(src_h, i) + 16) >> 5);
             let vp = clip_u8((fir6_v_scalar(rows_v, i) + 16) >> 5);
@@ -486,8 +498,14 @@ pub(crate) fn row_avg_h_v(src_h: &[u8], rows_v: [&[u8]; 6], out: &mut [u8], w: u
 
 /// Quarter-pel: `avg(h_half_pel, hv_half_pel)` — arms (2,1) and (2,3).
 #[inline(never)]
-pub(crate) fn row_avg_h_hv(src_h: &[u8], rows_hv: [&[u8]; 6], out: &mut [u8], w: usize) {
-    if level() == SimdLevel::Scalar {
+pub(crate) fn row_avg_h_hv(
+    src_h: &[u8],
+    rows_hv: [&[u8]; 6],
+    out: &mut [u8],
+    w: usize,
+    simd: bool,
+) {
+    if !simd {
         for i in 0..w {
             let hp = clip_u8((fir6_scalar(src_h, i) + 16) >> 5);
             let mut hh = [0i32; 6];
@@ -522,8 +540,14 @@ pub(crate) fn row_avg_h_hv(src_h: &[u8], rows_hv: [&[u8]; 6], out: &mut [u8], w:
 
 /// Quarter-pel: `avg(v_half_pel, hv_half_pel)` — arms (1,2) and (3,2).
 #[inline(never)]
-pub(crate) fn row_avg_v_hv(rows_v: [&[u8]; 6], rows_hv: [&[u8]; 6], out: &mut [u8], w: usize) {
-    if level() == SimdLevel::Scalar {
+pub(crate) fn row_avg_v_hv(
+    rows_v: [&[u8]; 6],
+    rows_hv: [&[u8]; 6],
+    out: &mut [u8],
+    w: usize,
+    simd: bool,
+) {
+    if !simd {
         for i in 0..w {
             let vp = clip_u8((fir6_v_scalar(rows_v, i) + 16) >> 5);
             let mut hh = [0i32; 6];
@@ -855,42 +879,42 @@ mod tests {
 
             let (a, b) = with_both_paths(|| {
                 let mut out = vec![0u8; w];
-                row_avg_int_h(&int_row, &src_h, &mut out, w);
+                row_avg_int_h(&int_row, &src_h, &mut out, w, !is_forced_scalar());
                 out
             });
             cmp("row_avg_int_h", w, &a, &b);
 
             let (a, b) = with_both_paths(|| {
                 let mut out = vec![0u8; w];
-                row_avg_h_int(&src_h, &int_row, &mut out, w);
+                row_avg_h_int(&src_h, &int_row, &mut out, w, !is_forced_scalar());
                 out
             });
             cmp("row_avg_h_int", w, &a, &b);
 
             let (a, b) = with_both_paths(|| {
                 let mut out = vec![0u8; w];
-                row_avg_int_v(&int_row, rows_v, &mut out, w);
+                row_avg_int_v(&int_row, rows_v, &mut out, w, !is_forced_scalar());
                 out
             });
             cmp("row_avg_int_v", w, &a, &b);
 
             let (a, b) = with_both_paths(|| {
                 let mut out = vec![0u8; w];
-                row_avg_h_v(&src_h, rows_v, &mut out, w);
+                row_avg_h_v(&src_h, rows_v, &mut out, w, !is_forced_scalar());
                 out
             });
             cmp("row_avg_h_v", w, &a, &b);
 
             let (a, b) = with_both_paths(|| {
                 let mut out = vec![0u8; w];
-                row_avg_h_hv(&src_h, rows_hv, &mut out, w);
+                row_avg_h_hv(&src_h, rows_hv, &mut out, w, !is_forced_scalar());
                 out
             });
             cmp("row_avg_h_hv", w, &a, &b);
 
             let (a, b) = with_both_paths(|| {
                 let mut out = vec![0u8; w];
-                row_avg_v_hv(rows_v, rows_hv, &mut out, w);
+                row_avg_v_hv(rows_v, rows_hv, &mut out, w, !is_forced_scalar());
                 out
             });
             cmp("row_avg_v_hv", w, &a, &b);
