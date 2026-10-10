@@ -79,6 +79,21 @@ pub(crate) fn level() -> SimdLevel {
     *LEVEL.get_or_init(detect_level)
 }
 
+static AVX2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static AVX2_INIT: std::sync::Once = std::sync::Once::new();
+
+/// Cheap AVX2 availability for per-chunk kernel selection inside unchecked
+/// `_simd` bodies: a one-time detection cached in a relaxed atomic load
+/// (checked per 16-pixel chunk, not per row).
+#[inline(always)]
+fn avx2() -> bool {
+    AVX2_INIT.call_once(|| {
+        let on = std::arch::is_x86_feature_detected!("avx2");
+        AVX2.store(on, Ordering::Release);
+    });
+    AVX2.load(Ordering::Relaxed)
+}
+
 // ---------------------------------------------------------------------------
 // Shared building blocks (all bit-exact against the scalar references)
 // ---------------------------------------------------------------------------
@@ -274,22 +289,27 @@ pub(crate) unsafe fn row_half_pel_h_simd(src: &[u8], out: &mut [u8], w: usize) {
     let mut i = 0;
     unsafe {
         while i + 16 <= w {
-            let p = src.as_ptr().add(i);
-            let l = [
-                _mm_loadu_si128(p as *const __m128i),
-                _mm_loadu_si128(p.add(1) as *const __m128i),
-                _mm_loadu_si128(p.add(2) as *const __m128i),
-                _mm_loadu_si128(p.add(3) as *const __m128i),
-                _mm_loadu_si128(p.add(4) as *const __m128i),
-                _mm_loadu_si128(p.add(5) as *const __m128i),
-            ];
-            let lo = fir6_acc_w(l.map(widen8));
-            let hi = fir6_acc_w(l.map(widen8_hi));
-            let packed = _mm_packus_epi16(
-                _mm_srai_epi16(_mm_add_epi16(lo, _mm_set1_epi16(16)), 5),
-                _mm_srai_epi16(_mm_add_epi16(hi, _mm_set1_epi16(16)), 5),
-            );
-            _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, packed);
+            if avx2() {
+                let p = src.as_ptr().add(i);
+                half_pel_h16_avx2(p, out.as_mut_ptr().add(i));
+            } else {
+                let p = src.as_ptr().add(i);
+                let l = [
+                    _mm_loadu_si128(p as *const __m128i),
+                    _mm_loadu_si128(p.add(1) as *const __m128i),
+                    _mm_loadu_si128(p.add(2) as *const __m128i),
+                    _mm_loadu_si128(p.add(3) as *const __m128i),
+                    _mm_loadu_si128(p.add(4) as *const __m128i),
+                    _mm_loadu_si128(p.add(5) as *const __m128i),
+                ];
+                let lo = fir6_acc_w(l.map(widen8));
+                let hi = fir6_acc_w(l.map(widen8_hi));
+                let packed = _mm_packus_epi16(
+                    _mm_srai_epi16(_mm_add_epi16(lo, _mm_set1_epi16(16)), 5),
+                    _mm_srai_epi16(_mm_add_epi16(hi, _mm_set1_epi16(16)), 5),
+                );
+                _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, packed);
+            }
             i += 16;
         }
         if i + 8 <= w {
@@ -301,6 +321,40 @@ pub(crate) unsafe fn row_half_pel_h_simd(src: &[u8], out: &mut [u8], w: usize) {
     while i < w {
         out[i] = clip_u8((fir6_scalar(src, i) + 16) >> 5);
         i += 1;
+    }
+}
+
+/// AVX2 horizontal half-pel FIR for one 16-wide chunk: the six 16-byte
+/// loads widen to full 16-lane i16 vectors in one `vpmovzxbw` each, so the
+/// whole FIR runs in single YMM registers instead of two XMM halves.
+/// Caller guarantees `p..p+21` and `out..out+16` valid.
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+unsafe fn half_pel_h16_avx2(p: *const u8, out: *mut u8) {
+    unsafe {
+        let load = |k: usize| _mm256_cvtepu8_epi16(_mm_loadu_si128(p.add(k) as *const __m128i));
+        let s0 = load(0);
+        let s1 = load(1);
+        let s2 = load(2);
+        let s3 = load(3);
+        let s4 = load(4);
+        let s5 = load(5);
+        // acc = (s0 + s5) + 20*(s2 + s3) - 5*(s1 + s4), i16-safe (max 10,710).
+        let t02 = _mm256_add_epi16(s0, s5);
+        let t13 = _mm256_add_epi16(s1, s4);
+        let t23 = _mm256_add_epi16(s2, s3);
+        let c20 = _mm256_set1_epi16(20);
+        let c5 = _mm256_set1_epi16(5);
+        let acc = _mm256_add_epi16(
+            t02,
+            _mm256_sub_epi16(_mm256_mullo_epi16(t23, c20), _mm256_mullo_epi16(t13, c5)),
+        );
+        let r = _mm256_srai_epi16(_mm256_add_epi16(acc, _mm256_set1_epi16(16)), 5);
+        // packus(a, a) lays out qwords [L, L, H, H] (L/H = saturated low/high
+        // 8 lanes); the contiguous 16-byte result is q0 + q2 → imm 0x28.
+        let packed = _mm256_packus_epi16(r, r);
+        let fixed = _mm256_permute4x64_epi64(packed, 0x28);
+        _mm_storeu_si128(out as *mut __m128i, _mm256_castsi256_si128(fixed));
     }
 }
 
