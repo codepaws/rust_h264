@@ -10,6 +10,12 @@ use crate::nal::NalUnitType;
 use crate::slice::SliceHeader;
 use crate::sps::Sps;
 
+#[cfg(test)]
+thread_local! {
+    // One-shot observer for deterministic producer/consumer synchronization tests.
+    pub(crate) static WAIT_ROWS_OBSERVER: std::cell::RefCell<Option<std::sync::mpsc::Sender<usize>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// Reference status of a picture in the DPB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceStatus {
@@ -98,6 +104,12 @@ impl DecodedPicture {
             return;
         }
         while self.row_progress.load(Ordering::Acquire) < rows {
+            #[cfg(test)]
+            WAIT_ROWS_OBSERVER.with(|observer| {
+                if let Some(sender) = observer.borrow_mut().take() {
+                    let _ = sender.send(rows);
+                }
+            });
             std::hint::spin_loop();
             std::thread::yield_now();
         }

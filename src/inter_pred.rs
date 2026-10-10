@@ -394,13 +394,6 @@ pub fn luma_mc_stride(
     let x_int = x + (dx >> 2);
     let y_int = y + (dy >> 2);
 
-    // Row-level sync: the reference may still be decoding (threaded
-    // pipeline). MC reads rows around the MOTION-SHIFTED position
-    // [y_int-2, y_int+h+4] worst case (margin 3 + quarter-pel extra 1);
-    // waits are no-ops for fully-published (serial) pictures.
-    let need_rows = (y_int + block_h as i32 + 4).clamp(0, ref_pic.height as i32) as usize;
-    ref_pic.wait_rows(need_rows);
-
     let pic_w = ref_pic.width as i32;
     let pic_h = if ref_stride == ref_pic.width as usize {
         ref_pic.height as i32
@@ -411,7 +404,6 @@ pub fn luma_mc_stride(
     let stride = ref_stride;
     let bw = block_w as i32;
     let bh = block_h as i32;
-    let ref_y = &ref_pic.y[ref_y_offset..];
 
     // Determine margins needed for the filter type
     // Half-pel filters need 2 pixels before and 3 after the block
@@ -433,7 +425,7 @@ pub fn luma_mc_stride(
         _ => 0,
     };
 
-    if block_in_bounds(
+    let in_bounds = block_in_bounds(
         x_int,
         y_int,
         bw + extra_r,
@@ -444,7 +436,24 @@ pub fn luma_mc_stride(
         margin_t,
         margin_r,
         margin_b,
-    ) {
+    );
+    let field_fallback = !in_bounds && (ref_y_offset > 0 || stride != ref_pic.width as usize);
+
+    // Progress counts physical frame rows, whereas y_int uses field-line
+    // units for MBAFF. Clamp the last logical row first (top-edge replication
+    // still reads row zero), then map it through the stride and field parity.
+    // Keep the conservative filter margin, also covering the following chroma
+    // bilinear reads. The boundary fallback below gathers the *whole* field.
+    let last_row = if field_fallback {
+        pic_h - 1
+    } else {
+        (y_int + bh + 3).clamp(0, pic_h - 1)
+    } as usize;
+    let need_rows = (ref_y_offset + last_row * stride) / ref_pic.width as usize + 1;
+    ref_pic.wait_rows(need_rows);
+    let ref_y = &ref_pic.y[ref_y_offset..];
+
+    if in_bounds {
         // Fast path: entire block + filter margins are in bounds
         // Access reference buffer directly without per-pixel clamping
         luma_mc_inner(
@@ -458,7 +467,7 @@ pub fn luma_mc_stride(
             frac_y,
             output,
         );
-    } else if ref_y_offset > 0 || stride != ref_pic.width as usize {
+    } else if field_fallback {
         // Field-coded boundary fallback: extract field lines into a temporary
         // DecodedPicture and use the standard interpolation on it.
         let field_h = pic_h as usize;
@@ -1196,6 +1205,60 @@ mod tests {
             structure: crate::dpb::PictureStructure::Frame,
             row_progress: std::sync::atomic::AtomicUsize::new(usize::MAX),
         })
+    }
+
+    #[test]
+    fn test_mc_waits_for_physical_rows() {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        // Top replication, in-bounds top/bottom fields, and field boundary
+        // extraction. Pixels are immutable here: this tests synchronization,
+        // independently of the shared pixel-storage ownership contract.
+        for (x, y, dy, h, stride, offset, published, minimum) in [
+            (0, 0, -128, 16, 16, 0, 0, 1),
+            (4, 16, 0, 4, 32, 0, 24, 39),
+            (4, 16, 0, 4, 32, 16, 24, 40),
+            (4, 16, 2, 4, 32, 0, 40, 45),
+            (-1, 0, 0, 4, 32, 0, 24, 63),
+            (-1, 0, 0, 4, 32, 16, 24, 64),
+        ] {
+            let pic = make_ref_pic(16, 64, (0..1024).map(|i| (i / 16) as u8).collect());
+            let mut expected = vec![0; 4 * h];
+            luma_mc_stride(&pic, x, y, 0, dy, 4, h, &mut expected, stride, offset);
+            pic.row_progress.store(published, Ordering::Release);
+            let (tx, rx) = mpsc::channel();
+            let consumer_pic = Arc::clone(&pic);
+            let consumer = std::thread::spawn(move || {
+                crate::dpb::WAIT_ROWS_OBSERVER.with(|observer| *observer.borrow_mut() = Some(tx));
+                let mut output = vec![0; 4 * h];
+                luma_mc_stride(
+                    &consumer_pic,
+                    x,
+                    y,
+                    0,
+                    dy,
+                    4,
+                    h,
+                    &mut output,
+                    stride,
+                    offset,
+                );
+                output
+            });
+            // The observer fires only inside the unsatisfied wait loop. The
+            // timeout is a failure bound, never evidence that a reader waited.
+            let waited = rx.recv_timeout(Duration::from_secs(5));
+            pic.row_progress.store(usize::MAX, Ordering::Release);
+            let output = consumer.join().unwrap();
+            assert!(
+                waited.is_ok(),
+                "reader skipped publication wait: {waited:?}"
+            );
+            assert!((minimum..=64).contains(&waited.unwrap()));
+            assert_eq!(output, expected);
+        }
     }
 
     #[test]
