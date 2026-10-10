@@ -864,6 +864,20 @@ mod tests {
     }
 
     #[test]
+    fn threaded_mc_progressive_and_mbaff_parity() {
+        for name in [
+            "p_multi_frame",
+            "mbaff_field_p_test",
+            "mbaff_field_cabac_test",
+        ] {
+            compare_threaded(
+                &format!("{}/testdata/{name}.h264", env!("CARGO_MANIFEST_DIR")),
+                2,
+            );
+        }
+    }
+
+    #[test]
     fn threaded_matches_serial_2_threads() {
         for stream in multiframe_streams() {
             compare_threaded(&stream, 2);
