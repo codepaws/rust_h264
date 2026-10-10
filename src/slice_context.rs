@@ -714,6 +714,7 @@ impl SliceContext<'_> {
 
         // Luma MC: per-4x4-block
         let mut luma_pred = [0u8; 256];
+        let mut any_staged = false;
         for (blk, &(blk_row, blk_col)) in BLOCK_INDEX_TO_OFFSET.iter().enumerate() {
             let bx = mb_x + blk_col;
             let mv0 = self.mv_store_l0[mb_idx * 16 + blk];
@@ -723,6 +724,10 @@ impl SliceContext<'_> {
             let bp0 = r0 >= 0;
             let bp1 = r1 >= 0;
             let mut blk_pred = [0u8; 16];
+            // Buffered paths (bi-pred, weighted uni) stage through blk_pred
+            // and scatter below; unweighted uni-pred blocks write straight
+            // into the frame plane and skip the staging entirely.
+            let mut staged = true;
             if bp0 && bp1 {
                 let mut p0 = [0u8; 16];
                 let mut p1 = [0u8; 16];
@@ -779,20 +784,38 @@ impl SliceContext<'_> {
                 };
                 let (mc_y, ref_stride, ref_y_off, _mc_cy, _c_ref_stride, _c_ref_off) =
                     self.mc_params(mb_idx, mb_y, ref_pic.width as usize, r0);
-                inter_pred::luma_mc_stride(
-                    ref_pic,
-                    bx as i32,
-                    mc_y + blk_row as i32,
-                    mv0[0] as i32,
-                    mv0[1] as i32,
-                    4,
-                    4,
-                    &mut blk_pred,
-                    ref_stride,
-                    ref_y_off,
-                );
                 if use_weight == 1 {
+                    inter_pred::luma_mc_stride(
+                        ref_pic,
+                        bx as i32,
+                        mc_y + blk_row as i32,
+                        mv0[0] as i32,
+                        mv0[1] as i32,
+                        4,
+                        4,
+                        &mut blk_pred,
+                        ref_stride,
+                        ref_y_off,
+                    );
                     wctx.apply_uni(&mut blk_pred, 0, r0 as usize, false, 0);
+                } else {
+                    staged = false;
+                    let (ly_off, ly_str) = (self.ly_offset, self.ly_stride);
+                    let y_dst = &mut self.frame.y
+                        [ly_off + blk_row * ly_str + mb_x + blk_col..];
+                    inter_pred::luma_mc_strided(
+                        ref_pic,
+                        bx as i32,
+                        mc_y + blk_row as i32,
+                        mv0[0] as i32,
+                        mv0[1] as i32,
+                        4,
+                        4,
+                        y_dst,
+                        ly_str,
+                        ref_stride,
+                        ref_y_off,
+                    );
                 }
             } else if bp1 {
                 let Some(ref_pic) = ref_pic_safe(ref_pic_list_l1, r1) else {
@@ -800,32 +823,58 @@ impl SliceContext<'_> {
                 };
                 let (mc_y, ref_stride, ref_y_off, _mc_cy, _c_ref_stride, _c_ref_off) =
                     self.mc_params(mb_idx, mb_y, ref_pic.width as usize, r1);
-                inter_pred::luma_mc_stride(
-                    ref_pic,
-                    bx as i32,
-                    mc_y + blk_row as i32,
-                    mv1[0] as i32,
-                    mv1[1] as i32,
-                    4,
-                    4,
-                    &mut blk_pred,
-                    ref_stride,
-                    ref_y_off,
-                );
                 if use_weight == 1 {
+                    inter_pred::luma_mc_stride(
+                        ref_pic,
+                        bx as i32,
+                        mc_y + blk_row as i32,
+                        mv1[0] as i32,
+                        mv1[1] as i32,
+                        4,
+                        4,
+                        &mut blk_pred,
+                        ref_stride,
+                        ref_y_off,
+                    );
                     wctx.apply_uni(&mut blk_pred, 1, r1 as usize, false, 0);
+                } else {
+                    staged = false;
+                    let (ly_off, ly_str) = (self.ly_offset, self.ly_stride);
+                    let y_dst = &mut self.frame.y
+                        [ly_off + blk_row * ly_str + mb_x + blk_col..];
+                    inter_pred::luma_mc_strided(
+                        ref_pic,
+                        bx as i32,
+                        mc_y + blk_row as i32,
+                        mv1[0] as i32,
+                        mv1[1] as i32,
+                        4,
+                        4,
+                        y_dst,
+                        ly_str,
+                        ref_stride,
+                        ref_y_off,
+                    );
                 }
             }
-            for r in 0..4 {
-                for c in 0..4 {
-                    luma_pred[(blk_row + r) * 16 + blk_col + c] = blk_pred[r * 4 + c];
+            if staged {
+                any_staged = true;
+                for r in 0..4 {
+                    let src = &blk_pred[r * 4..r * 4 + 4];
+                    let dst = (blk_row + r) * 16 + blk_col;
+                    luma_pred[dst..dst + 4].copy_from_slice(src);
                 }
             }
         }
-        for r in 0..16 {
-            let src = &luma_pred[r * 16..r * 16 + 16];
-            let dst_off = self.ly_offset + r * self.ly_stride + mb_x;
-            self.frame.y[dst_off..dst_off + 16].copy_from_slice(src);
+        // Only copy the staged MB out when at least one block went through
+        // the buffer; fully direct-written MBs must not be overwritten by
+        // the (zeroed) staging buffer.
+        if any_staged {
+            for r in 0..16 {
+                let src = &luma_pred[r * 16..r * 16 + 16];
+                let dst_off = self.ly_offset + r * self.ly_stride + mb_x;
+                self.frame.y[dst_off..dst_off + 16].copy_from_slice(src);
+            }
         }
 
         // Chroma MC: per-4x4-block
