@@ -374,16 +374,20 @@ pub(crate) unsafe fn row_half_pel_v_simd(rows: [&[u8]; 6], out: &mut [u8], w: us
     let mut i = 0;
     unsafe {
         while i + 16 <= w {
-            let l: [__m128i; 6] = rows.map(|r| {
-                _mm_loadu_si128(r.as_ptr().add(i) as *const __m128i)
-            });
-            let lo = fir6_acc_w(l.map(widen8));
-            let hi = fir6_acc_w(l.map(widen8_hi));
-            let packed = _mm_packus_epi16(
-                _mm_srai_epi16(_mm_add_epi16(lo, _mm_set1_epi16(16)), 5),
-                _mm_srai_epi16(_mm_add_epi16(hi, _mm_set1_epi16(16)), 5),
-            );
-            _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, packed);
+            if avx2() {
+                half_pel_v16_avx2(&rows, i, out.as_mut_ptr().add(i));
+            } else {
+                let l: [__m128i; 6] = rows.map(|r| {
+                    _mm_loadu_si128(r.as_ptr().add(i) as *const __m128i)
+                });
+                let lo = fir6_acc_w(l.map(widen8));
+                let hi = fir6_acc_w(l.map(widen8_hi));
+                let packed = _mm_packus_epi16(
+                    _mm_srai_epi16(_mm_add_epi16(lo, _mm_set1_epi16(16)), 5),
+                    _mm_srai_epi16(_mm_add_epi16(hi, _mm_set1_epi16(16)), 5),
+                );
+                _mm_storeu_si128(out.as_mut_ptr().add(i) as *mut __m128i, packed);
+            }
             i += 16;
         }
         if i + 8 <= w {
@@ -395,6 +399,37 @@ pub(crate) unsafe fn row_half_pel_v_simd(rows: [&[u8]; 6], out: &mut [u8], w: us
     while i < w {
         out[i] = clip_u8((fir6_v_scalar(rows, i) + 16) >> 5);
         i += 1;
+    }
+}
+
+/// AVX2 vertical half-pel FIR for one 16-wide chunk from six row slices at
+/// byte offset `i`: same YMM-widened FIR as the horizontal kernel, with the
+/// six loads coming from the six rows. Caller guarantees `i + 16 <= row len`.
+#[target_feature(enable = "avx2")]
+#[inline(never)]
+unsafe fn half_pel_v16_avx2(rows: &[&[u8]; 6], i: usize, out: *mut u8) {
+    unsafe {
+        let load = |r: &[u8]| _mm256_cvtepu8_epi16(_mm_loadu_si128(r.as_ptr().add(i) as *const __m128i));
+        let s0 = load(rows[0]);
+        let s1 = load(rows[1]);
+        let s2 = load(rows[2]);
+        let s3 = load(rows[3]);
+        let s4 = load(rows[4]);
+        let s5 = load(rows[5]);
+        let t02 = _mm256_add_epi16(s0, s5);
+        let t13 = _mm256_add_epi16(s1, s4);
+        let t23 = _mm256_add_epi16(s2, s3);
+        let c20 = _mm256_set1_epi16(20);
+        let c5 = _mm256_set1_epi16(5);
+        let acc = _mm256_add_epi16(
+            t02,
+            _mm256_sub_epi16(_mm256_mullo_epi16(t23, c20), _mm256_mullo_epi16(t13, c5)),
+        );
+        let r = _mm256_srai_epi16(_mm256_add_epi16(acc, _mm256_set1_epi16(16)), 5);
+        // Same pack layout as the horizontal kernel: [L, L, H, H] -> q0 + q2.
+        let packed = _mm256_packus_epi16(r, r);
+        let fixed = _mm256_permute4x64_epi64(packed, 0x28);
+        _mm_storeu_si128(out as *mut __m128i, _mm256_castsi256_si128(fixed));
     }
 }
 
