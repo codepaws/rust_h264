@@ -561,7 +561,9 @@ fn run_picture_inner(
                     Err(e) => return Err(e),
                 }
             } else {
-                let backup = ps.clone();
+                // `ps` is the empty replacement; retain the valid picture
+                // taken above so a malformed continuation cannot erase it.
+                let backup = taken.clone();
                 match run_slice_job(&job, taken, &slice.rbsp, &mut on_row) {
                     Ok(done) => *ps = done,
                     Err(_) => {
@@ -941,6 +943,36 @@ mod tests {
             bits.push_str(&format!("{sample:08b}").repeat(384));
         }
         sequence_test_nal(NalUnitType::Slice, &bits)
+    }
+
+    #[test]
+    fn malformed_continuation_retains_pixels_and_completes_progress() {
+        let sps = sequence_test_sps(2, 2);
+        let pps = sequence_test_nal(NalUnitType::Pps, "1100111000111100");
+        let first = sequence_test_slice(0, 2, 61);
+        let mut malformed = sequence_test_slice(2, 1, 93);
+        malformed.rbsp = malformed.rbsp[..8].to_vec().into();
+        let mut decoder = ThreadedDecoder::new(1);
+        for nal in [&sps, &pps, &first, &malformed] {
+            decoder.decode_nal(nal).unwrap();
+        }
+        let slot = decoder.open.as_ref().unwrap().slot.clone();
+        decoder.close_open_picture().unwrap();
+        let picture = slot.get().unwrap().clone();
+        let frames = decoder.flush();
+        assert_eq!(frames.len(), 1);
+        assert_eq!((frames[0].width, frames[0].height), (32, 32));
+        assert!(frames[0].y[..32 * 16].iter().all(|&v| v == 61));
+        assert!(frames[0].u[..16 * 8].iter().all(|&v| v == 61));
+        assert!(frames[0].v[..16 * 8].iter().all(|&v| v == 61));
+        assert_eq!(
+            picture
+                .row_progress
+                .load(std::sync::atomic::Ordering::Acquire),
+            usize::MAX
+        );
+        assert!(decoder.slots.is_empty());
+        assert_eq!(decoder.unfinished, 0);
     }
 
     #[test]
