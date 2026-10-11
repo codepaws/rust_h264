@@ -1116,11 +1116,10 @@ pub fn chroma_mc_strided(
     }
     // Field-coded MBAFF may pass the frame height with a doubled field stride.
     // Clamp to the available rows before either full-pel path samples the plane.
-    let ref_height = if ref_width > 0 {
-        ref_height.min(ref_plane.len() / ref_width)
-    } else {
-        ref_height
-    };
+    let ref_height = ref_plane
+        .len()
+        .checked_div(ref_width)
+        .map_or(ref_height, |available| ref_height.min(available));
     let frac_x = dx.rem_euclid(8);
     let frac_y = dy.rem_euclid(8);
     let x_int = x + (dx >> 3);
@@ -1395,6 +1394,20 @@ pub fn weighted_bi_implicit(pred_l0: &[u8], pred_l1: &[u8], output: &mut [u8], w
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn strided_chroma_zero_reference_stride_preserves_padding() {
+        for (dx, dy) in [(0, 0), (1, 1)] {
+            let mut packed = [199u8; 8];
+            let mut strided = [199u8; 12];
+            chroma_mc(&[73; 32], 0, 32, 0, 0, dx, dy, 4, 2, &mut packed);
+            chroma_mc_strided(&[73; 32], 0, 32, 0, 0, dx, dy, 4, 2, &mut strided, 8);
+            assert_eq!(packed, [0; 8]);
+            assert_eq!(&strided[..4], &packed[..4]);
+            assert_eq!(&strided[8..], &packed[4..]);
+            assert_eq!(&strided[4..8], &[199; 4]);
+        }
+    }
 
     #[test]
     fn strided_chroma_replicates_field_bottom_and_preserves_padding() {
