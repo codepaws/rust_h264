@@ -1114,6 +1114,13 @@ pub fn chroma_mc_strided(
     if (block_h - 1) * out_stride + block_w > output.len() {
         return;
     }
+    // Field-coded MBAFF may pass the frame height with a doubled field stride.
+    // Clamp to the available rows before either full-pel path samples the plane.
+    let ref_height = if ref_width > 0 {
+        ref_height.min(ref_plane.len() / ref_width)
+    } else {
+        ref_height
+    };
     let frac_x = dx.rem_euclid(8);
     let frac_y = dy.rem_euclid(8);
     let x_int = x + (dx >> 3);
@@ -1388,6 +1395,33 @@ pub fn weighted_bi_implicit(pred_l0: &[u8], pred_l1: &[u8], output: &mut [u8], w
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn strided_chroma_replicates_field_bottom_and_preserves_padding() {
+        let plane = [73u8; 1024];
+        for field_offset in [0, 32] {
+            for y in [8, 15] {
+                let field = &plane[field_offset..];
+                let mut packed = [0u8; 64];
+                let mut strided = [199u8; 456];
+                chroma_mc(field, 64, 32, 8, y, 0, 8, 8, 8, &mut packed);
+                chroma_mc_strided(field, 64, 32, 8, y, 0, 8, 8, 8, &mut strided, 64);
+                assert_eq!(packed, [73; 64]);
+                for row in 0..8 {
+                    assert_eq!(
+                        &strided[row * 64..row * 64 + 8],
+                        &packed[row * 8..row * 8 + 8],
+                        "field {field_offset}, y {y}, row {row}"
+                    );
+                    if row < 7 {
+                        assert!(strided[row * 64 + 8..(row + 1) * 64]
+                            .iter()
+                            .all(|&v| v == 199));
+                    }
+                }
+            }
+        }
+    }
 
     fn make_ref_pic(width: u32, height: u32, y_data: Vec<u8>) -> Arc<DecodedPicture> {
         let uv_size = (width / 2 * height / 2) as usize;
