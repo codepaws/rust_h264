@@ -178,7 +178,7 @@ fn is_high_profile(profile_idc: u8) -> bool {
 
 /// Parse an SPS from RBSP data (NAL header byte already stripped).
 pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
-    let mut r = BitstreamReader::new(rbsp);
+    let mut r = BitstreamReader::new_borrowed(rbsp);
 
     let profile_idc = r.read_bits(8)? as u8;
     let constraint_set0_flag = r.read_bit()? != 0;

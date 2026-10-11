@@ -134,13 +134,35 @@ pub(crate) fn chroma_field_mv_offset_impl(
     if !field_pic_flag {
         return 0;
     }
-    let ref_is_bottom = ref_pic.structure == PictureStructure::BottomField;
-    if bottom_field_flag == ref_is_bottom {
-        0 // same parity
-    } else if bottom_field_flag {
-        2 // bottom referencing top: +2
+    match (bottom_field_flag, ref_pic.structure) {
+        (true, PictureStructure::TopField) => 2,
+        (false, PictureStructure::BottomField) => -2,
+        _ => 0,
+    }
+}
+
+/// Table 8-10 offset when a frame picture contains field-coded MBAFF MB pairs.
+/// `ref_idx` is the original field index, before `frame_ref_idx` maps it to
+/// the frame holding the selected reference field.
+pub(crate) fn chroma_mb_field_mv_offset_impl(
+    field_pic_flag: bool,
+    bottom_field_flag: bool,
+    mbaff: bool,
+    mb_field_decoding: &[bool],
+    mb_idx: usize,
+    ref_idx: i8,
+    ref_pic: &DecodedPicture,
+) -> i32 {
+    if mbaff && mb_field_decoding[mb_idx / 2] {
+        if ref_idx & 1 == 0 {
+            0
+        } else if mb_idx & 1 == 0 {
+            -2
+        } else {
+            2
+        }
     } else {
-        -2 // top referencing bottom: -2
+        chroma_field_mv_offset_impl(field_pic_flag, bottom_field_flag, ref_pic)
     }
 }
 
@@ -155,11 +177,25 @@ impl SliceContext<'_> {
 
     /// Compute the chroma MV vertical offset for field pictures.
     /// When a field references a field of opposite parity, the chroma MV needs
-    /// a ±2 eighth-pel offset to compensate for the interlaced chroma sampling
-    /// grid difference (spec 8.4.2.2, FFmpeg h264_mb.c lines 289-293).
-    /// Returns the offset in eighth-pel units (added to the luma MV for chroma MC).
-    pub(crate) fn chroma_field_mv_offset(&self, ref_pic: &DecodedPicture) -> i32 {
-        chroma_field_mv_offset_impl(self.field_pic_flag, self.bottom_field_flag, ref_pic)
+    /// a ±2 offset to compensate for the interlaced chroma sampling grid
+    /// (Rec. ITU-T H.264 (08/2021), 8.4.1.4, Table 8-10).
+    /// The offset is in vertical chroma MV units (one eighth chroma sample
+    /// for 4:2:0), added to the luma MV value before chroma MC.
+    pub(crate) fn chroma_field_mv_offset(
+        &self,
+        mb_idx: usize,
+        ref_idx: i8,
+        ref_pic: &DecodedPicture,
+    ) -> i32 {
+        chroma_mb_field_mv_offset_impl(
+            self.field_pic_flag,
+            self.bottom_field_flag,
+            self.mbaff,
+            self.mb_field_decoding,
+            mb_idx,
+            ref_idx,
+            ref_pic,
+        )
     }
 
     /// Set per-MB pixel layout (stride and y-offset) based on field/frame coding.
@@ -329,13 +365,18 @@ impl SliceContext<'_> {
                 }
                 Some(above_mb)
             } else {
-                // Top MB: above is bottom of above pair
+                // Table 6-4 (6.4.12.2): for a top field-coded MB above a
+                // field-coded pair, yM = yN, so the above MB is the top
+                // member of that pair (same field). Otherwise it is the
+                // bottom member of the above pair.
                 let pair_row = pair_addr / self.mb_width as usize;
                 if pair_row == 0 {
                     return None;
                 }
                 let above_pair = pair_addr - self.mb_width as usize;
-                let above_mb = above_pair * 2 + 1; // bottom of above pair
+                let above_pair_is_field = self.mb_field_decoding[above_pair];
+                let above_mb = above_pair * 2
+                    + usize::from(!(is_field && above_pair_is_field));
                 if self.mb_slice_id[above_mb] != self.this_slice_id {
                     return None;
                 }
@@ -440,7 +481,7 @@ impl SliceContext<'_> {
             let cstride = self.lc_stride;
             let cbase = self.lc_offset;
             // Field picture chroma MV offset for opposite-parity reference
-            let chroma_mv_y_offset = self.chroma_field_mv_offset(ref_pic);
+            let chroma_mv_y_offset = self.chroma_field_mv_offset(mb_idx, 0, ref_pic);
             let cmv_y = mvp_y as i32 + chroma_mv_y_offset;
             if use_weight == 1 {
                 // Weighted prediction needs packed buffers to filter before
@@ -918,8 +959,8 @@ impl SliceContext<'_> {
                     } else {
                         &rl1.v[c_ref_off_l1..]
                     };
-                    let cmv_y0 = mv0[1] as i32 + self.chroma_field_mv_offset(rl0);
-                    let cmv_y1 = mv1[1] as i32 + self.chroma_field_mv_offset(rl1);
+                    let cmv_y0 = mv0[1] as i32 + self.chroma_field_mv_offset(mb_idx, r0, rl0);
+                    let cmv_y1 = mv1[1] as i32 + self.chroma_field_mv_offset(mb_idx, r1, rl1);
                     inter_pred::chroma_mc(
                         cr0,
                         c_ref_stride_l0,
@@ -964,7 +1005,7 @@ impl SliceContext<'_> {
                     } else {
                         &ref_pic.v[c_ref_off..]
                     };
-                    let cmv_y = mv0[1] as i32 + self.chroma_field_mv_offset(ref_pic);
+                    let cmv_y = mv0[1] as i32 + self.chroma_field_mv_offset(mb_idx, r0, ref_pic);
                     inter_pred::chroma_mc(
                         cr,
                         c_ref_stride,
@@ -991,7 +1032,7 @@ impl SliceContext<'_> {
                     } else {
                         &ref_pic.v[c_ref_off..]
                     };
-                    let cmv_y = mv1[1] as i32 + self.chroma_field_mv_offset(ref_pic);
+                    let cmv_y = mv1[1] as i32 + self.chroma_field_mv_offset(mb_idx, r1, ref_pic);
                     inter_pred::chroma_mc(
                         cr,
                         c_ref_stride,
@@ -1485,5 +1526,60 @@ impl SliceContext<'_> {
                 self.ref_poc_store_l0[i] = l0_list[ri as usize].pic_order_cnt;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod chroma_field_offset_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    fn reference(structure: PictureStructure) -> DecodedPicture {
+        DecodedPicture {
+            y: vec![], u: vec![], v: vec![], width: 0, height: 0,
+            frame_num: 0, pic_order_cnt: 0, mv_l0: vec![], ref_idx_l0: vec![],
+            ref_poc_l0: vec![], mv_l1: vec![], ref_idx_l1: vec![],
+            mb_width: 0, is_intra: false, structure,
+            row_progress: AtomicUsize::new(usize::MAX),
+        }
+    }
+
+    #[test]
+    fn chroma_field_offset_follows_h264_table_8_10() {
+        let cases = [
+            (true, true, PictureStructure::TopField, 2),
+            (true, false, PictureStructure::BottomField, -2),
+            (true, false, PictureStructure::TopField, 0),
+            (true, true, PictureStructure::BottomField, 0),
+            (true, false, PictureStructure::Frame, 0),
+            (true, true, PictureStructure::Frame, 0),
+            (false, false, PictureStructure::TopField, 0),
+            (false, false, PictureStructure::BottomField, 0),
+            (false, true, PictureStructure::TopField, 0),
+            (false, true, PictureStructure::BottomField, 0),
+        ];
+        for (field_pic, bottom_field, structure, expected) in cases {
+            assert_eq!(
+                chroma_field_mv_offset_impl(field_pic, bottom_field, &reference(structure)),
+                expected,
+                "current field={field_pic} bottom={bottom_field} reference={structure:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mbaff_chroma_offset_uses_selected_reference_field_parity() {
+        let frame = reference(PictureStructure::Frame);
+        for (mb_idx, ref_idx, expected) in [
+            (0, 0, 0), (0, 1, -2), (1, 0, 0), (1, 1, 2),
+            (2, 2, 0), (2, 3, -2), (3, 2, 0), (3, 3, 2),
+        ] {
+            assert_eq!(
+                chroma_mb_field_mv_offset_impl(false, false, true, &[true, true], mb_idx, ref_idx, &frame),
+                expected,
+                "MBAFF mb_idx={mb_idx} ref_idx={ref_idx}"
+            );
+        }
+        assert_eq!(chroma_mb_field_mv_offset_impl(false, false, true, &[false], 0, 1, &frame), 0);
     }
 }

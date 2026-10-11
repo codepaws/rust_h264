@@ -1,11 +1,10 @@
 /// Bitstream reader for parsing H.264 NAL unit RBSP data.
 /// Reads bits left-to-right (MSB first).
 ///
-/// The internal buffer is padded with zero bytes so that `read_bit` can skip
-/// per-bit bounds checks in the hot path. Only `bits_remaining` and
-/// `more_rbsp_data` use the true data length.
-pub struct BitstreamReader {
-    data: Vec<u8>,
+/// Decode readers own a zero-padded buffer. Header readers can borrow RBSP
+/// bytes and treat the same 128-byte suffix as virtual zero padding.
+pub struct BitstreamReader<'a> {
+    data: std::borrow::Cow<'a, [u8]>,
     data_len: usize, // actual RBSP length (excluding padding)
     byte_offset: usize,
     bit_offset: u8, // 0-7, bits already consumed in current byte
@@ -17,29 +16,57 @@ pub struct BitstreamReader {
 /// 128 bytes = 1024 bits covers the worst case for any single MB decode.
 const PADDING: usize = 128;
 
-impl BitstreamReader {
+impl BitstreamReader<'static> {
     pub fn new(rbsp: &[u8]) -> Self {
         let data_len = rbsp.len();
         let mut data = Vec::with_capacity(data_len + PADDING);
         data.extend_from_slice(rbsp);
         data.resize(data_len + PADDING, 0);
         Self {
-            data,
+            data: std::borrow::Cow::Owned(data),
             data_len,
             byte_offset: 0,
             bit_offset: 0,
         }
     }
+}
+
+impl<'a> BitstreamReader<'a> {
+    /// Parse a header without copying its RBSP. The virtual padding matches `new`.
+    pub fn new_borrowed(rbsp: &'a [u8]) -> Self {
+        Self {
+            data: std::borrow::Cow::Borrowed(rbsp),
+            data_len: rbsp.len(),
+            byte_offset: 0,
+            bit_offset: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn padded_len(&self) -> usize {
+        self.data_len + PADDING
+    }
+
+    #[inline(always)]
+    fn padded_byte(&self, offset: usize) -> u8 {
+        if offset < self.data_len { self.data[offset] } else { 0 }
+    }
 
     /// Read a single bit, returning 0 or 1.
-    /// Does not bounds-check on every call; relies on padding to avoid
-    /// out-of-bounds reads. Call `bits_remaining` to check before bulk reads.
+    /// Reads zero bits through the padded suffix, then returns an error.
+    /// Call `bits_remaining` to check the actual RBSP length before bulk reads.
     #[inline(always)]
     pub fn read_bit(&mut self) -> Result<u8, &'static str> {
-        if self.byte_offset >= self.data.len() {
-            return Err("end of bitstream");
-        }
-        let bit = (self.data[self.byte_offset] >> (7 - self.bit_offset)) & 1;
+        let byte = match &self.data {
+            std::borrow::Cow::Owned(data) => *data.get(self.byte_offset).ok_or("end of bitstream")?,
+            std::borrow::Cow::Borrowed(data) => {
+                if self.byte_offset >= self.padded_len() {
+                    return Err("end of bitstream");
+                }
+                data.get(self.byte_offset).copied().unwrap_or(0)
+            }
+        };
+        let bit = (byte >> (7 - self.bit_offset)) & 1;
         self.bit_offset += 1;
         if self.bit_offset == 8 {
             self.bit_offset = 0;
@@ -64,8 +91,8 @@ impl BitstreamReader {
         let mut bit_offset = self.bit_offset;
         for _ in 0..n {
             // Padding guarantees in-bounds for reasonable peek sizes
-            if byte_offset < self.data.len() {
-                val = (val << 1) | ((self.data[byte_offset] >> (7 - bit_offset)) & 1) as u32;
+            if byte_offset < self.padded_len() {
+                val = (val << 1) | ((self.padded_byte(byte_offset) >> (7 - bit_offset)) & 1) as u32;
             } else {
                 val <<= 1;
             }
@@ -168,13 +195,26 @@ impl BitstreamReader {
 
     /// Peek at the byte at the current byte_offset (for debugging).
     pub fn peek_byte(&self) -> u8 {
-        self.data[self.byte_offset]
+        assert!(self.byte_offset < self.padded_len(), "byte peek past padding");
+        self.padded_byte(self.byte_offset)
     }
 
-    /// Peek at a slice of bytes starting at byte_offset (for debugging).
-    pub fn peek_bytes(&self, n: usize) -> &[u8] {
-        let end = (self.byte_offset + n).min(self.data.len());
-        &self.data[self.byte_offset..end]
+    /// Peek at bytes including zero padding (for debugging). Borrowed readers
+    /// allocate only when the requested range crosses into virtual padding.
+    pub fn peek_bytes(&self, n: usize) -> std::borrow::Cow<'_, [u8]> {
+        let end = self.byte_offset.saturating_add(n).min(self.padded_len());
+        if self.byte_offset >= end {
+            return std::borrow::Cow::Borrowed(&[]);
+        }
+        if end <= self.data.len() {
+            return std::borrow::Cow::Borrowed(&self.data[self.byte_offset..end]);
+        }
+        let mut bytes = Vec::with_capacity(end - self.byte_offset);
+        if self.byte_offset < self.data_len {
+            bytes.extend_from_slice(&self.data[self.byte_offset..self.data_len]);
+        }
+        bytes.resize(end - self.byte_offset, 0);
+        std::borrow::Cow::Owned(bytes)
     }
 
     /// Get the byte-aligned position for CABAC initialization.
@@ -263,5 +303,39 @@ mod tests {
         }
         // Now we're past the padded buffer — must return Err, not panic
         assert!(r.read_bit().is_err());
+    }
+
+    #[test]
+    fn borrowed_reader_matches_padded_reader_at_truncated_boundaries() {
+        for data in [&[][..], &[0x80][..], &[0x00, 0x55][..], &[0xff, 0x00, 0x80][..]] {
+            let mut padded = BitstreamReader::new(data);
+            let mut borrowed = BitstreamReader::new_borrowed(data);
+            for _ in 0..(data.len() + PADDING) * 8 + 1 {
+                assert_eq!(borrowed.bits_remaining(), padded.bits_remaining());
+                assert_eq!(borrowed.more_rbsp_data(), padded.more_rbsp_data());
+                assert_eq!(borrowed.peek_bits(12), padded.peek_bits(12));
+                assert_eq!(borrowed.read_bit(), padded.read_bit());
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_byte_peeks_match_owned_across_virtual_padding() {
+        let data = [0x12, 0x34];
+        let mut owned = BitstreamReader::new(&data);
+        let mut borrowed = BitstreamReader::new_borrowed(&data);
+        for offset in [0, 1, 2, 3, data.len() + PADDING - 1, data.len() + PADDING] {
+            owned.byte_offset = offset;
+            borrowed.byte_offset = offset;
+            if offset < data.len() + PADDING {
+                assert_eq!(borrowed.peek_byte(), owned.peek_byte(), "offset={offset}");
+            } else {
+                assert!(std::panic::catch_unwind(|| owned.peek_byte()).is_err());
+                assert!(std::panic::catch_unwind(|| borrowed.peek_byte()).is_err());
+            }
+            for n in [0, 1, 4, usize::MAX] {
+                assert_eq!(borrowed.peek_bytes(n), owned.peek_bytes(n), "offset={offset}, n={n}");
+            }
+        }
     }
 }

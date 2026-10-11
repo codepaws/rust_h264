@@ -102,8 +102,28 @@ pub fn parse_slice_header(
     pps: &Pps,
     nal_unit_type: NalUnitType,
     nal_ref_idc: u8,
-) -> Result<(SliceHeader, BitstreamReader), &'static str> {
-    let mut r = BitstreamReader::new(rbsp);
+) -> Result<(SliceHeader, BitstreamReader<'static>), &'static str> {
+    parse_slice_header_with_reader(BitstreamReader::new(rbsp), sps, pps, nal_unit_type, nal_ref_idc)
+}
+
+/// Header-only parse for coordinator work that does not retain the reader.
+pub(crate) fn parse_slice_header_borrowed<'a>(
+    rbsp: &'a [u8],
+    sps: &Sps,
+    pps: &Pps,
+    nal_unit_type: NalUnitType,
+    nal_ref_idc: u8,
+) -> Result<(SliceHeader, BitstreamReader<'a>), &'static str> {
+    parse_slice_header_with_reader(BitstreamReader::new_borrowed(rbsp), sps, pps, nal_unit_type, nal_ref_idc)
+}
+
+fn parse_slice_header_with_reader<'a>(
+    mut r: BitstreamReader<'a>,
+    sps: &Sps,
+    pps: &Pps,
+    nal_unit_type: NalUnitType,
+    nal_ref_idc: u8,
+) -> Result<(SliceHeader, BitstreamReader<'a>), &'static str> {
 
     let first_mb_in_slice = r.read_ue()?;
     let slice_type_raw = r.read_ue()?;
@@ -420,5 +440,27 @@ mod tests {
         assert_eq!(header.pic_parameter_set_id, 0);
         assert_eq!(header.frame_num, 0);
         assert_eq!(header.idr_pic_id, Some(0));
+    }
+
+    #[test]
+    fn borrowed_slice_header_matches_owned_position_and_truncation() {
+        let data = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/single_frame.h264")).unwrap();
+        let nals = parse_annex_b(&data);
+        let sps = parse_sps(&nals.iter().find(|n| n.nal_unit_type == NalUnitType::Sps).unwrap().rbsp).unwrap();
+        let pps = parse_pps(&nals.iter().find(|n| n.nal_unit_type == NalUnitType::Pps).unwrap().rbsp, None).unwrap();
+        let rbsp = &nals.iter().find(|n| n.nal_unit_type == NalUnitType::SliceIdr).unwrap().rbsp;
+        for len in 0..=rbsp.len() {
+            let owned = parse_slice_header(&rbsp[..len], &sps, &pps, NalUnitType::SliceIdr, 3);
+            let borrowed = parse_slice_header_borrowed(&rbsp[..len], &sps, &pps, NalUnitType::SliceIdr, 3);
+            match (owned, borrowed) {
+                (Ok((a, ar)), Ok((b, br))) => {
+                    assert_eq!(format!("{a:?}"), format!("{b:?}"), "len={len}");
+                    assert_eq!(ar.position(), br.position(), "len={len}");
+                    assert_eq!(ar.peek_bits(24), br.peek_bits(24), "len={len}");
+                }
+                (Err(a), Err(b)) => assert_eq!(a, b, "len={len}"),
+                _ => panic!("reader modes disagree at len={len}"),
+            }
+        }
     }
 }

@@ -543,3 +543,61 @@ B-frame/IDR-heavy content re-anchors and stays byte-exact. If real
 content shows divergences, the investigation starts at the
 transform/intra rounding path upstream, not in this fork's SIMD or
 threading (both bit-exact with the serial decoder by construction).
+
+## Bounded allocation and copy pass (2026-10-11)
+
+This pass removed redundant RBSP copies, reused private serial decode scratch
+storage, and replaced whole-field boundary copies in motion compensation with
+a local clamped tile of at most 441 bytes for normal H.264 blocks up to
+16×16. The original whole-field publication wait is preserved. The serial
+scratch buffer retains its peak array
+capacity for reuse, trading some persistent private memory for fewer
+allocations. The benchmark now surfaces decode errors and checks frame counts;
+untimed validation passes fingerprint all decoded pixels.
+
+The same updated benchmark harness was built against the `HEAD` baseline and
+the working tree on the same Windows machine. Values below are **median fps**
+from each paired round; round 2 reversed the run order. Most runs used three
+timed passes; deblock used seven, and CAVLC used five. Warmup fingerprints
+matched between builds for every stream, and each untimed validation matched
+its warmup.
+
+| Stream / mode | Round 1 before → after | Round 2 before → after |
+|---|---:|---:|
+| 1080p B, 1 thread | 40 → 50 | 59 → 58 |
+| 1080p B, 4 workers | 82 → 104 | 132 → 140 |
+| 720p P, 1 thread | 247 → 373 | 236 → 289 |
+| 720p B, 1 thread | 206 → 218 | 154 → 156 |
+| 1080p deblock, 1 thread | 49 → 50 | 46 → 37 |
+| 1080p CAVLC, 1 thread | 63 → 73 | 64 → 70 |
+
+The deblock variance prompted a separate ABBA follow-up with 11 timed passes
+per run. Median wall times were 0.190/0.189 s before and 0.188/0.188 s after:
+approximately unchanged. Fingerprints matched; the original two-round table
+remains above to show the observed variance.
+
+The large between-round swings show substantial machine or measurement
+variance. The 720p P and CAVLC streams improved in both rounds; other cases
+were mixed or smaller, so these measurements do not support a universal
+speedup claim. Verification: 204 library tests passed with 1 ignored, 2
+benchmark example tests passed, 6 documentation tests passed, and the
+all-targets/all-features check passed. This pass's changes were based solely
+on code in this repository. Historical source provenance was not
+independently certified.
+
+### Paired 720p follow-up (2026-10-12)
+
+The current working tree was compared with the local `HEAD` release build using
+the same `bench_decode` harness and `--iterations 3`, with run order reversed
+for the second round. Warmup full-frame fingerprints matched for both builds
+on both streams. Median FPS was:
+
+| Stream | Round 1 baseline → working tree | Round 2 baseline → working tree |
+|---|---:|---:|
+| 720p P-only | 372 → 386 | 330 → 313 |
+| 720p B-frames | 173 → 186 | 166 → 180 |
+
+These short runs were noisy. The P-only direction changed between rounds, and
+the B-frame medians also varied substantially between runs. This supports no
+general speedup claim. The 1080p cases were not remeasured, so this is a
+partial comparison only. Raw output is in ignored `target/spec-audit/perf-followup.txt`.

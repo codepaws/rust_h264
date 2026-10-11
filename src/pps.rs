@@ -33,7 +33,7 @@ pub struct Pps {
 /// Parse a PPS from RBSP data (NAL header byte already stripped).
 /// `sps` is needed to inherit scaling lists when PPS doesn't override them.
 pub fn parse_pps(rbsp: &[u8], sps: Option<&Sps>) -> Result<Pps, &'static str> {
-    let mut r = BitstreamReader::new(rbsp);
+    let mut r = BitstreamReader::new_borrowed(rbsp);
 
     let pic_parameter_set_id = r.read_ue()?;
     let seq_parameter_set_id = r.read_ue()?;

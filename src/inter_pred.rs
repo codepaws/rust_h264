@@ -508,8 +508,8 @@ fn luma_mc_dispatch(
     // Progress counts physical frame rows, whereas y_int uses field-line
     // units for MBAFF. Clamp the last logical row first (top-edge replication
     // still reads row zero), then map it through the stride and field parity.
-    // Keep the conservative filter margin, also covering the following chroma
-    // bilinear reads. The boundary fallback below gathers the *whole* field.
+    // Chroma MC follows this call without its own publication wait, so field
+    // references still require the conservative whole-field publication bound.
     let last_row = if field_fallback {
         pic_h - 1
     } else {
@@ -539,49 +539,48 @@ fn luma_mc_dispatch(
             simd,
         );
     } else if field_fallback {
-        // Field-coded boundary fallback: extract field lines into a temporary
-        // DecodedPicture and use the standard interpolation on it.
-        let field_h = pic_h as usize;
-        let field_w = pic_w as usize;
-        let mut field_buf = vec![0u8; field_w * field_h];
-        for r in 0..field_h {
-            let src_off = ref_y_offset + r * stride;
-            let dst_off = r * field_w;
-            for c in 0..field_w {
-                if src_off + c < ref_pic.y.len() {
-                    field_buf[dst_off + c] = ref_pic.y[src_off + c];
-                }
-            }
-        }
-        let field_pic = DecodedPicture {
-            y: field_buf,
-            u: vec![],
-            v: vec![],
-            width: field_w as u32,
-            height: field_h as u32,
-            pic_order_cnt: 0,
-            frame_num: 0,
-            mv_l0: vec![],
-            ref_idx_l0: vec![],
-            ref_poc_l0: vec![],
-            mv_l1: vec![],
-            ref_idx_l1: vec![],
-            mb_width: 0,
-            is_intra: false,
-            structure: crate::dpb::PictureStructure::Frame,
-            row_progress: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        // Materialize just the clamped filter footprint. Padding turns every
+        // sample needed by the in-bounds kernel into an ordinary tile access.
+        let Some(tile_w) = block_w.checked_add((margin_l + margin_r) as usize) else {
+            return;
         };
-        for row in 0..block_h {
-            for col in 0..block_w {
-                output[row * out_stride + col] = luma_interp(
-                    &field_pic,
-                    x_int + col as i32,
-                    y_int + row as i32,
-                    frac_x,
-                    frac_y,
-                );
+        let Some(tile_h) = block_h.checked_add((margin_t + margin_b) as usize) else {
+            return;
+        };
+        let Some(tile_len) = tile_w.checked_mul(tile_h) else {
+            return;
+        };
+        // H.264 prediction blocks are at most 16x16, including a 5-sample
+        // filter skirt on each axis. Keep a fallback for larger caller blocks.
+        let mut stack_tile = [0u8; 21 * 21];
+        let mut heap_tile: Vec<u8>;
+        let tile: &mut [u8] = if tile_len <= stack_tile.len() {
+            &mut stack_tile[..tile_len]
+        } else {
+            heap_tile = vec![0u8; tile_len];
+            &mut heap_tile
+        };
+        for r in 0..tile_h {
+            let field_row = (y_int + r as i32 - margin_t).clamp(0, pic_h - 1) as usize;
+            let src_row = ref_y_offset + field_row * stride;
+            for c in 0..tile_w {
+                let field_col = (x_int + c as i32 - margin_l).clamp(0, pic_w - 1) as usize;
+                tile[r * tile_w + c] = ref_pic.y.get(src_row + field_col).copied().unwrap_or(0);
             }
         }
+        luma_mc_inner(
+            tile,
+            tile_w,
+            margin_l as usize,
+            margin_t as usize,
+            block_w,
+            block_h,
+            frac_x,
+            frac_y,
+            output,
+            out_stride,
+            crate::simd_enabled(),
+        );
     } else {
         // Boundary fallback: per-pixel with clamping
         for row in 0..block_h {
@@ -1422,11 +1421,11 @@ mod tests {
         // independently of the shared pixel-storage ownership contract.
         for (x, y, dy, h, stride, offset, published, minimum) in [
             (0, 0, -128, 16, 16, 0, 0, 1),
-            (4, 16, 0, 4, 32, 0, 24, 39),
-            (4, 16, 0, 4, 32, 16, 24, 40),
-            (4, 16, 2, 4, 32, 0, 40, 45),
-            (-1, 0, 0, 4, 32, 0, 24, 63),
-            (-1, 0, 0, 4, 32, 16, 24, 64),
+            (4, 16, 0, 4, 32, 0, 24, 47),
+            (4, 16, 0, 4, 32, 16, 24, 48),
+            (4, 16, 2, 4, 32, 0, 40, 47),
+            (-1, 0, 0, 4, 32, 0, 0, 63),
+            (-1, 0, 0, 4, 32, 16, 0, 64),
         ] {
             let pic = make_ref_pic(16, 64, (0..1024).map(|i| (i / 16) as u8).collect());
             let mut expected = vec![0; 4 * h];
@@ -1460,8 +1459,93 @@ mod tests {
                 waited.is_ok(),
                 "reader skipped publication wait: {waited:?}"
             );
-            assert!((minimum..=64).contains(&waited.unwrap()));
+            assert_eq!(waited.unwrap(), minimum);
             assert_eq!(output, expected);
+        }
+    }
+
+    #[test]
+    fn field_boundary_matches_clamped_interpolation() {
+        let width = 16usize;
+        let height = 64usize;
+        let pixels: Vec<u8> = (0..width * height)
+            .map(|i| ((i * 37 + (i / width) * 19) & 255) as u8)
+            .collect();
+        let frame = make_ref_pic(width as u32, height as u32, pixels.clone());
+
+        for parity in 0..2 {
+            let field_pixels: Vec<u8> = (0..height / 2)
+                .flat_map(|r| pixels[(2 * r + parity) * width..(2 * r + parity + 1) * width].to_vec())
+                .collect();
+            let field = make_ref_pic(width as u32, (height / 2) as u32, field_pixels);
+            for &(x, y) in &[(-4, -3), (0, 0), (14, 0), (0, 30), (14, 30), (7, 15)] {
+                for size in [4usize, 8, 16, 17] {
+                    for dx in -1..4 {
+                        for dy in -1..4 {
+                            let x_int = x + (dx >> 2);
+                            let y_int = y + (dy >> 2);
+                            let mut actual = vec![0u8; size * size];
+                            luma_mc_stride(&frame, x, y, dx, dy, size, size, &mut actual, width * 2, parity * width);
+                            let out_stride = size + 3;
+                            let mut strided = vec![0xa5u8; size * out_stride];
+                            luma_mc_strided(&frame, x, y, dx, dy, size, size, &mut strided, out_stride, width * 2, parity * width);
+                            for r in 0..size {
+                                for c in 0..size {
+                                    let want = luma_interp(&field, x_int + c as i32, y_int + r as i32,
+                                        dx.rem_euclid(4), dy.rem_euclid(4));
+                                    assert_eq!(actual[r * size + c], want,
+                                        "parity={parity} size={size} x={x} y={y} dx={dx} dy={dy} r={r} c={c}");
+                                    assert_eq!(strided[r * out_stride + c], want);
+                                }
+                                assert_eq!(&strided[r * out_stride + size..r * out_stride + out_stride], &[0xa5; 3]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn field_boundary_waits_for_chroma_publication() {
+        use std::sync::atomic::Ordering;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        for parity in 0..2 {
+            let pic = make_ref_pic(16, 64, (0..1024).map(|i| (i & 255) as u8).collect());
+            let needed = 2 * (32 - 1) + parity + 1;
+            pic.row_progress.store(0, Ordering::Release);
+            let (tx, rx) = mpsc::channel();
+            let shared = Arc::clone(&pic);
+            let worker = std::thread::spawn(move || {
+                crate::dpb::WAIT_ROWS_OBSERVER.with(|observer| *observer.borrow_mut() = Some(tx));
+                let mut out = [0u8; 16];
+                luma_mc_stride(&shared, -1, 2, 1, 2, 4, 4, &mut out, 32, parity * 16);
+                out
+            });
+            let waited = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(waited, needed);
+            pic.row_progress.store(needed, Ordering::Release);
+            assert_eq!(worker.join().unwrap().len(), 16);
+        }
+    }
+
+    #[test]
+    fn field_boundary_keeps_missing_samples_zero_filled() {
+        let pixels: Vec<u8> = (0..1000).map(|i| (i & 255) as u8).collect();
+        let frame = make_ref_pic(16, 64, pixels.clone());
+        let field_pixels: Vec<u8> = (0..32)
+            .flat_map(|r| (0..16).map(move |c| (2 * r + 1) * 16 + c))
+            .map(|i| pixels.get(i).copied().unwrap_or(0))
+            .collect();
+        let field = make_ref_pic(16, 32, field_pixels);
+        let mut actual = [0u8; 16];
+        luma_mc_stride(&frame, 14, 30, 2, 2, 4, 4, &mut actual, 32, 16);
+        for r in 0..4 {
+            for c in 0..4 {
+                assert_eq!(actual[r * 4 + c], luma_interp(&field, 14 + c as i32, 30 + r as i32, 2, 2));
+            }
         }
     }
 

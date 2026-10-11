@@ -10,9 +10,56 @@ use crate::error::DecodeError;
 use crate::mv_pred::WeightContext;
 use crate::nal::{NalUnit, NalUnitType};
 use crate::pps::{parse_pps, Pps};
-use crate::slice::{parse_slice_header, SliceHeader, SliceType};
+use crate::slice::{parse_slice_header, parse_slice_header_borrowed, SliceHeader, SliceType};
 use crate::slice_context::{SliceContext, SliceParams};
 use crate::sps::{parse_sps, Sps};
+
+#[cfg(test)]
+thread_local! {
+    static CAVLC_MBAFF_SKIPPED_PAIR_CASES: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    static B_MBAFF_SKIP_DIRECT_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn b_mbaff_skip_direct_counts() -> (usize, usize) {
+    B_MBAFF_SKIP_DIRECT_COUNTS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_b_mbaff_skip_direct_counts() {
+    B_MBAFF_SKIP_DIRECT_COUNTS.with(|counts| counts.set((0, 0)));
+}
+
+#[cfg(test)]
+pub(crate) fn cavlc_mbaff_skipped_pair_cases() -> (usize, usize) {
+    CAVLC_MBAFF_SKIPPED_PAIR_CASES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_cavlc_mbaff_skipped_pair_cases() {
+    CAVLC_MBAFF_SKIPPED_PAIR_CASES.with(|cases| cases.set((0, 0)));
+}
+
+/// Derive an absent MBAFF pair field flag as specified by H.264 clause 7.4.4.
+fn inferred_pair_field_mode(
+    pair: usize,
+    mb_width: usize,
+    field_modes: &[bool],
+    slice_ids: &[u16],
+    current_slice: u16,
+) -> bool {
+    let neighbor_in_slice = |neighbor_pair: usize| {
+        slice_ids[neighbor_pair * 2] == current_slice
+            && slice_ids[neighbor_pair * 2 + 1] == current_slice
+    };
+    if pair % mb_width != 0 && neighbor_in_slice(pair - 1) {
+        field_modes[pair - 1]
+    } else if pair >= mb_width && neighbor_in_slice(pair - mb_width) {
+        field_modes[pair - mb_width]
+    } else {
+        false
+    }
+}
 
 /// A decoded YUV 4:2:0 frame.
 ///
@@ -108,6 +155,98 @@ pub(crate) struct PictureState {
     pub(crate) deblocked_rows: usize,
 }
 
+/// Private per-picture decode state. Only the serial decoder retains one set.
+#[derive(Default)]
+pub(crate) struct PictureScratch {
+    nc_luma: Vec<u8>,
+    nc_cb: Vec<u8>,
+    nc_cr: Vec<u8>,
+    mvd_store: Vec<[i16; 2]>,
+    mvd_store_l1: Vec<[i16; 2]>,
+    mb_info: Vec<MbInfo>,
+    i4x4_modes: Vec<u8>,
+    mb_cbp: Vec<u16>,
+    mb_chroma_pred: Vec<u8>,
+    mb_is_8x8dct: Vec<bool>,
+    mb_skip: Vec<bool>,
+    mb_is_direct: Vec<bool>,
+    blk_is_direct: Vec<bool>,
+    is_i16x16: Vec<bool>,
+    mb_slice_id: Vec<u16>,
+    mb_field_decoding: Vec<bool>,
+}
+
+impl PictureScratch {
+    fn take_from(ps: &mut PictureState) -> Self {
+        Self {
+            nc_luma: std::mem::take(&mut ps.nc_luma),
+            nc_cb: std::mem::take(&mut ps.nc_cb),
+            nc_cr: std::mem::take(&mut ps.nc_cr),
+            mvd_store: std::mem::take(&mut ps.mvd_store),
+            mvd_store_l1: std::mem::take(&mut ps.mvd_store_l1),
+            mb_info: std::mem::take(&mut ps.mb_info),
+            i4x4_modes: std::mem::take(&mut ps.i4x4_modes),
+            mb_cbp: std::mem::take(&mut ps.mb_cbp),
+            mb_chroma_pred: std::mem::take(&mut ps.mb_chroma_pred),
+            mb_is_8x8dct: std::mem::take(&mut ps.mb_is_8x8dct),
+            mb_skip: std::mem::take(&mut ps.mb_skip),
+            mb_is_direct: std::mem::take(&mut ps.mb_is_direct),
+            blk_is_direct: std::mem::take(&mut ps.blk_is_direct),
+            is_i16x16: std::mem::take(&mut ps.is_i16x16),
+            mb_slice_id: std::mem::take(&mut ps.mb_slice_id),
+            mb_field_decoding: std::mem::take(&mut ps.mb_field_decoding),
+        }
+    }
+
+    fn prepare(mut self, total_mbs: usize) -> Self {
+        macro_rules! reset {
+            ($field:ident, $len:expr, $value:expr) => {{
+                let had_values = !self.$field.is_empty();
+                self.$field.resize($len, $value);
+                if had_values {
+                    self.$field.fill($value);
+                }
+            }};
+        }
+        reset!(nc_luma, total_mbs * 16, 0);
+        reset!(nc_cb, total_mbs * 4, 0);
+        reset!(nc_cr, total_mbs * 4, 0);
+        reset!(mvd_store, total_mbs * 16, [0; 2]);
+        reset!(mvd_store_l1, total_mbs * 16, [0; 2]);
+        reset!(mb_info, total_mbs, MbInfo::default());
+        reset!(i4x4_modes, total_mbs * 16, 2);
+        reset!(mb_cbp, total_mbs, 0);
+        reset!(mb_chroma_pred, total_mbs, 0);
+        reset!(mb_is_8x8dct, total_mbs, false);
+        reset!(mb_skip, total_mbs, false);
+        reset!(mb_is_direct, total_mbs, false);
+        reset!(blk_is_direct, total_mbs * 16, false);
+        reset!(is_i16x16, total_mbs, false);
+        reset!(mb_slice_id, total_mbs, 0);
+        reset!(mb_field_decoding, total_mbs.div_ceil(2), false);
+        self
+    }
+
+    fn put_into(self, ps: &mut PictureState) {
+        ps.nc_luma = self.nc_luma;
+        ps.nc_cb = self.nc_cb;
+        ps.nc_cr = self.nc_cr;
+        ps.mvd_store = self.mvd_store;
+        ps.mvd_store_l1 = self.mvd_store_l1;
+        ps.mb_info = self.mb_info;
+        ps.i4x4_modes = self.i4x4_modes;
+        ps.mb_cbp = self.mb_cbp;
+        ps.mb_chroma_pred = self.mb_chroma_pred;
+        ps.mb_is_8x8dct = self.mb_is_8x8dct;
+        ps.mb_skip = self.mb_skip;
+        ps.mb_is_direct = self.mb_is_direct;
+        ps.blk_is_direct = self.blk_is_direct;
+        ps.is_i16x16 = self.is_i16x16;
+        ps.mb_slice_id = self.mb_slice_id;
+        ps.mb_field_decoding = self.mb_field_decoding;
+    }
+}
+
 /// Streaming H.264 decoder.
 ///
 /// Feed NAL units one at a time with [`decode_nal`](Self::decode_nal) and
@@ -145,6 +284,7 @@ pub struct Decoder {
     pending: Option<PictureState>,
     /// First field of a field-picture pair awaiting its complement for output.
     pending_field: Option<Frame>,
+    scratch: Option<PictureScratch>,
 }
 
 impl Default for Decoder {
@@ -162,6 +302,7 @@ impl Decoder {
             dpb: Dpb::new(0),
             pending: None,
             pending_field: None,
+            scratch: None,
         }
     }
 
@@ -189,7 +330,7 @@ impl Decoder {
             NalUnitType::Pps => {
                 let pps_id_sps = {
                     // Peek at seq_parameter_set_id to find the right SPS
-                    let mut peek = BitstreamReader::new(&nal.rbsp);
+                    let mut peek = BitstreamReader::new_borrowed(&nal.rbsp);
                     let _ = peek.read_ue(); // pic_parameter_set_id
                     peek.read_ue().ok()
                 };
@@ -201,7 +342,7 @@ impl Decoder {
             NalUnitType::Sei => Ok(None),
             NalUnitType::SliceIdr | NalUnitType::Slice => {
                 // Peek at first_mb_in_slice to detect new vs continuation slice
-                let mut peek = BitstreamReader::new(&nal.rbsp);
+                let mut peek = BitstreamReader::new_borrowed(&nal.rbsp);
                 let first_mb = peek.read_ue().unwrap_or(0);
 
                 // Check if this is a new picture: first_mb==0 means first
@@ -290,6 +431,7 @@ impl Decoder {
 
         // Apply deblocking filter
         deblock_picture(&mut ps);
+        self.scratch = Some(PictureScratch::take_from(&mut ps));
 
         if ps.nal_unit_type == NalUnitType::SliceIdr {
             self.dpb.clear();
@@ -503,6 +645,7 @@ impl Decoder {
             &mut self.dpb,
             &mut pending,
             nal,
+            Some(&mut self.scratch),
         );
         let (job, ps) = match prepared {
             Ok(v) => v,
@@ -514,6 +657,16 @@ impl Decoder {
             }
         };
         let ps = run_slice_job(&job, ps, &nal.rbsp, &mut |_, _, _, _, _, _, _| {})?;
+        #[cfg(test)]
+        if job.header.slice_type == SliceType::B && ps.mbaff_frame_flag {
+            B_MBAFF_SKIP_DIRECT_COUNTS.with(|counts| {
+                let (skipped, direct) = counts.get();
+                counts.set((
+                    skipped + ps.mb_skip.iter().filter(|&&v| v).count(),
+                    direct + ps.mb_is_direct.iter().filter(|&&v| v).count(),
+                ));
+            });
+        }
         self.pending = Some(ps);
         Ok(())
     }
@@ -744,6 +897,7 @@ pub(crate) fn prepare_slice_job<P: crate::dpb::PicRef>(
     dpb: &mut Dpb<P>,
     pending: &mut Option<PictureState>,
     nal: &NalUnit,
+    mut scratch: Option<&mut Option<PictureScratch>>,
 ) -> Result<(SliceJobShell<P>, PictureState), DecodeError> {
         let pps = pps_table
             .values()
@@ -754,7 +908,7 @@ pub(crate) fn prepare_slice_job<P: crate::dpb::PicRef>(
             .ok_or(DecodeError::InvalidSyntax("no SPS available"))?;
 
         let (header, _reader) =
-            parse_slice_header(&nal.rbsp, sps, pps, nal.nal_unit_type, nal.nal_ref_idc)?;
+            parse_slice_header_borrowed(&nal.rbsp, sps, pps, nal.nal_unit_type, nal.nal_ref_idc)?;
 
         if header.slice_type != SliceType::I
             && header.slice_type != SliceType::P
@@ -940,7 +1094,7 @@ pub(crate) fn prepare_slice_job<P: crate::dpb::PicRef>(
         let ps = if is_continuation {
             pending.take().unwrap()
         } else {
-            PictureState {
+            let mut ps = PictureState {
                 frame: Frame {
                     width,
                     height,
@@ -953,26 +1107,26 @@ pub(crate) fn prepare_slice_job<P: crate::dpb::PicRef>(
                 poc: current_poc,
                 nal_unit_type: nal.nal_unit_type,
                 nal_ref_idc: nal.nal_ref_idc,
-                nc_luma: vec![0u8; total_mbs * 16],
-                nc_cb: vec![0u8; total_mbs * 4],
-                nc_cr: vec![0u8; total_mbs * 4],
+                nc_luma: Vec::new(),
+                nc_cb: Vec::new(),
+                nc_cr: Vec::new(),
                 mv_store_l0: vec![[0i16; 2]; total_mbs * 16],
                 mv_store_l1: vec![[0i16; 2]; total_mbs * 16],
                 ref_idx_store_l0: vec![-1i8; total_mbs * 16],
                 ref_poc_store_l0: vec![-1i32; total_mbs * 16],
                 ref_idx_store_l1: vec![-1i8; total_mbs * 16],
-                mvd_store: vec![[0i16; 2]; total_mbs * 16],
-                mvd_store_l1: vec![[0i16; 2]; total_mbs * 16],
-                mb_info: vec![deblock::MbInfo::default(); total_mbs],
-                i4x4_modes: vec![2u8; total_mbs * 16],
-                mb_cbp: vec![0u16; total_mbs],
-                mb_chroma_pred: vec![0u8; total_mbs],
-                mb_is_8x8dct: vec![false; total_mbs],
-                mb_skip: vec![false; total_mbs],
-                mb_is_direct: vec![false; total_mbs],
-                blk_is_direct: vec![false; total_mbs * 16],
-                is_i16x16: vec![false; total_mbs],
-                mb_slice_id: vec![0u16; total_mbs],
+                mvd_store: Vec::new(),
+                mvd_store_l1: Vec::new(),
+                mb_info: Vec::new(),
+                i4x4_modes: Vec::new(),
+                mb_cbp: Vec::new(),
+                mb_chroma_pred: Vec::new(),
+                mb_is_8x8dct: Vec::new(),
+                mb_skip: Vec::new(),
+                mb_is_direct: Vec::new(),
+                blk_is_direct: Vec::new(),
+                is_i16x16: Vec::new(),
+                mb_slice_id: Vec::new(),
                 current_slice_id: 0,
                 prev_mb_qp: slice_qp,
                 last_qp_delta_nonzero: false,
@@ -985,13 +1139,16 @@ pub(crate) fn prepare_slice_job<P: crate::dpb::PicRef>(
                 chroma_qp_index_offset: pps.chroma_qp_index_offset,
                 mb_width,
                 mb_height,
-                mb_field_decoding: vec![false; total_mbs.div_ceil(2)],
+                mb_field_decoding: Vec::new(),
                 mbaff_frame_flag: header.mbaff_frame_flag,
                 field_pic_flag: header.field_pic_flag,
                 bottom_field_flag: header.bottom_field_flag,
                 frame_height,
                 deblocked_rows: 0,
-            }
+            };
+            scratch.as_mut().and_then(|slot| slot.take())
+                .unwrap_or_default().prepare(total_mbs).put_into(&mut ps);
+            ps
         };
 
 
@@ -1150,6 +1307,10 @@ let PictureState {
     };
 
     let mut mb_skip_run: i32 = -1; // -1 = not initialized for P slices
+    // A skipped MBAFF top cannot be reconstructed until the pair field mode
+    // is signalled by a coded bottom or inferred for a fully skipped pair.
+    let mut pending_cavlc_skipped_top: Option<usize> = None;
+    let mut prefetched_mbaff_bottom_skip: Option<bool> = None;
 
     let stride = coded_width as usize;
     let mbaff = header.mbaff_frame_flag;
@@ -1201,6 +1362,27 @@ let PictureState {
                 bottom_field_flag: header.bottom_field_flag,
             }
         };
+    }
+
+    macro_rules! decode_cavlc_skip_mb {
+        ($idx:expr, $x:expr, $y:expr, $params:expr) => {{
+            let mut ctx = make_ctx!();
+            ctx.set_mb_layout($idx, $x, $y);
+            mb_ly_stride = ctx.ly_stride;
+            mb_ly_offset = ctx.ly_offset;
+            mb_lc_stride = ctx.lc_stride;
+            mb_lc_offset = ctx.lc_offset;
+            if is_p_slice {
+                ctx.decode_p_skip_mb($idx, $x, $y, $params);
+            } else {
+                ctx.decode_b_skip_mb($idx, $x, $y, $params);
+            }
+            mb_info[$idx] = MbInfo {
+                mb_type: MbType::Inter,
+                qp_y: prev_mb_qp,
+                ..Default::default()
+            };
+        }};
     }
 
     let params = SliceParams {
@@ -1325,9 +1507,15 @@ let PictureState {
             // with MBAFF-adjusted first_mb comparison for terminate).
             {
                 let mut ctx = make_ctx!();
-                match ctx.decode_cabac_mb(cr, st, rbsp, mb_idx, mb_x, mb_y, &params)? {
+                match ctx.decode_cabac_mb(
+                    cr, st, rbsp, mb_idx, mb_x, mb_y, &params,
+                    prefetched_mbaff_bottom_skip.take(),
+                )? {
                     CabacMbResult::EndOfSlice => break,
                     CabacMbResult::Decoded => {}
+                    CabacMbResult::DecodedWithBottomSkip(skipped) => {
+                        prefetched_mbaff_bottom_skip = Some(skipped);
+                    }
                 }
                 prev_mb_qp = ctx.prev_mb_qp;
                 last_qp_delta_nonzero = ctx.last_qp_delta_nonzero;
@@ -1352,27 +1540,38 @@ let PictureState {
             if mb_skip_run > 0 {
                 mb_skip_run -= 1;
                 mb_skip[mb_idx] = true; // Mark as skipped for MBAFF field flag inference
-                                        // Set layout for skip MBs (field_flag already known)
-                {
-                    let mut ctx = make_ctx!();
-                    ctx.set_mb_layout(mb_idx, mb_x, mb_y);
-                    mb_ly_stride = ctx.ly_stride;
-                    mb_ly_offset = ctx.ly_offset;
-                    mb_lc_stride = ctx.lc_stride;
-                    mb_lc_offset = ctx.lc_offset;
-                }
-                if is_p_slice {
-                    // P_Skip: MV = median predictor, ref_idx = 0, no residual
-                    make_ctx!().decode_p_skip_mb(mb_idx, mb_x, mb_y, &params);
+                if mbaff && mb_idx.is_multiple_of(2) {
+                    // Clause 7.4.4 requires deferring the top until its pair
+                    // mode is known from the bottom syntax or inference.
+                    pending_cavlc_skipped_top = Some(mb_idx);
+                } else if mbaff {
+                    if let Some(top_idx) = pending_cavlc_skipped_top.take() {
+                        // Both members were skipped, so neither carries a field
+                        // flag. Infer it before reconstructing either member.
+                        _mb_field_decoding[top_idx / 2] = inferred_pair_field_mode(
+                            top_idx / 2,
+                            mb_width as usize,
+                            &_mb_field_decoding,
+                            &mb_slice_id,
+                            this_slice_id,
+                        );
+                        #[cfg(test)]
+                        if _mb_field_decoding[top_idx / 2] {
+                            CAVLC_MBAFF_SKIPPED_PAIR_CASES.with(|cases| {
+                                let (signalled, inferred) = cases.get();
+                                cases.set((signalled, inferred + 1));
+                            });
+                        }
+                        let top_x = (top_idx / 2 % mb_width as usize) * 16;
+                        let top_y = (top_idx / 2 / mb_width as usize) * 32;
+                        decode_cavlc_skip_mb!(top_idx, top_x, top_y, &params);
+                        decode_cavlc_skip_mb!(mb_idx, mb_x, mb_y, &params);
+                    } else {
+                        decode_cavlc_skip_mb!(mb_idx, mb_x, mb_y, &params);
+                    }
                 } else {
-                    // B_Skip: spatial/temporal direct MV + MC, no residual
-                    make_ctx!().decode_b_skip_mb(mb_idx, mb_x, mb_y, &params);
+                    decode_cavlc_skip_mb!(mb_idx, mb_x, mb_y, &params);
                 }
-                mb_info[mb_idx] = MbInfo {
-                    mb_type: MbType::Inter,
-                    qp_y: prev_mb_qp,
-                    ..Default::default()
-                };
                 mb_idx += 1;
                 continue;
             }
@@ -1386,6 +1585,27 @@ let PictureState {
                 let top_was_skipped = !is_top && mb_skip[mb_idx - 1];
                 if is_top || top_was_skipped {
                     _mb_field_decoding[mb_idx / 2] = reader.read_bit()? != 0;
+                }
+                if !is_top && top_was_skipped {
+                    if let Some(top_idx) = pending_cavlc_skipped_top.take() {
+                        #[cfg(test)]
+                        if _mb_field_decoding[top_idx / 2] {
+                            CAVLC_MBAFF_SKIPPED_PAIR_CASES.with(|cases| {
+                                let (signalled, inferred) = cases.get();
+                                cases.set((signalled + 1, inferred));
+                            });
+                        }
+                        let top_x = (top_idx / 2 % mb_width as usize) * 16;
+                        let top_y = (top_idx / 2 / mb_width as usize) * 32;
+                        decode_cavlc_skip_mb!(top_idx, top_x, top_y, &params);
+                        // Restore current-MB layout after reconstructing top.
+                        let mut ctx = make_ctx!();
+                        ctx.set_mb_layout(mb_idx, mb_x, mb_y);
+                        mb_ly_stride = ctx.ly_stride;
+                        mb_ly_offset = ctx.ly_offset;
+                        mb_lc_stride = ctx.lc_stride;
+                        mb_lc_offset = ctx.lc_offset;
+                    }
                 }
             }
         }
@@ -1413,6 +1633,21 @@ let PictureState {
         if !use_cabac && !reader.more_rbsp_data() {
             break;
         }
+    }
+
+    // A slice may end after a skipped top. Its flag is absent, so infer the
+    // pair mode under clause 7.4.4 before reconstructing that macroblock.
+    if let Some(top_idx) = pending_cavlc_skipped_top.take() {
+        _mb_field_decoding[top_idx / 2] = inferred_pair_field_mode(
+            top_idx / 2,
+            mb_width as usize,
+            &_mb_field_decoding,
+            &mb_slice_id,
+            this_slice_id,
+        );
+        let top_x = (top_idx / 2 % mb_width as usize) * 16;
+        let top_y = (top_idx / 2 / mb_width as usize) * 32;
+        decode_cavlc_skip_mb!(top_idx, top_x, top_y, &params);
     }
 
     // Post-loop: fill deblock info and ref POC table for the remaining
@@ -1659,6 +1894,34 @@ impl OrderedDecoder {
 mod tests {
     use super::*;
     use crate::nal::parse_annex_b;
+
+    #[test]
+    fn picture_scratch_reuses_and_resets_across_sizes() {
+        let mut ps = PictureState::empty();
+        ps.nc_luma = vec![7; 16];
+        ps.mb_info = vec![MbInfo::default(); 1];
+        ps.i4x4_modes = vec![9; 16];
+        ps.mb_slice_id = vec![3; 1];
+        let original = ps.nc_luma.as_ptr();
+        let mut scratch = PictureScratch::take_from(&mut ps);
+        let reused = scratch.prepare(1);
+        assert_eq!(reused.nc_luma.as_ptr(), original);
+        assert_eq!(reused.nc_luma, vec![0; 16]);
+        assert_eq!(reused.i4x4_modes, vec![2; 16]);
+        assert_eq!(reused.mb_slice_id, vec![0; 1]);
+        let mut ps = PictureState::empty();
+        reused.put_into(&mut ps);
+        scratch = PictureScratch::take_from(&mut ps);
+        let grown = scratch.prepare(4);
+        assert_eq!(grown.nc_luma.len(), 64);
+        assert!(grown.nc_luma.iter().all(|&value| value == 0));
+        let mut ps = PictureState::empty();
+        grown.put_into(&mut ps);
+        scratch = PictureScratch::take_from(&mut ps);
+        let shrunk = scratch.prepare(2);
+        assert_eq!(shrunk.nc_luma.len(), 32);
+        assert!(shrunk.nc_luma.iter().all(|&value| value == 0));
+    }
 
     #[test]
     fn test_decode_single_idr_frame() {
@@ -3101,4 +3364,74 @@ mod tests {
     fn test_mbaff_field_high() {
         decode_multiframe_and_compare("mbaff_field_high_test", 4, 64, 64);
     }
+
+    #[test]
+    fn test_mbaff_cabac_skipped_top_pair_transitions() {
+        crate::decode_cabac::reset_mbaff_skipped_top_transitions();
+        decode_multiframe_and_compare("mbaff_cabac_p_test", 5, 64, 64);
+        decode_multiframe_and_compare("mbaff_cabac_b_test", 8, 64, 64);
+        decode_multiframe_and_compare("mbaff_field_cabac_test", 4, 64, 64);
+        let (coded_bottom, skipped_bottom, coded_field_bottom) =
+            crate::decode_cabac::mbaff_skipped_top_transitions();
+        assert!(coded_bottom > 0, "fixtures must exercise skipped-top/coded-bottom pairs");
+        assert!(skipped_bottom > 0, "fixtures must exercise fully skipped pairs");
+        assert!(coded_bottom > coded_field_bottom, "fixtures must signal frame mode after skipped top");
+    }
+
+    #[test]
+    fn test_mbaff_cabac_skipped_top_field_bottom() {
+        crate::decode_cabac::reset_mbaff_skipped_top_transitions();
+        decode_multiframe_and_compare("mbaff_cabac_skipped_top_field_bottom_test", 4, 64, 32);
+        let (_, _, coded_field_bottom) = crate::decode_cabac::mbaff_skipped_top_transitions();
+        assert!(
+            coded_field_bottom > 0,
+            "fixture must exercise skipped-top/coded-bottom pair signalling field mode"
+        );
+    }
+
+    #[test]
+    fn test_mbaff_cavlc_skipped_top_field_bottom() {
+        reset_cavlc_mbaff_skipped_pair_cases();
+        decode_multiframe_and_compare("mbaff_cavlc_skipped_top_field_bottom_test", 4, 64, 32);
+        let (signalled_field_bottom, _) = cavlc_mbaff_skipped_pair_cases();
+        assert!(
+            signalled_field_bottom > 0,
+            "fixture must exercise skipped-top/coded-bottom with a signalled field mode"
+        );
+    }
+
+    #[test]
+    fn test_mbaff_cavlc_fully_skipped_inferred_field() {
+        reset_cavlc_mbaff_skipped_pair_cases();
+        decode_multiframe_and_compare("mbaff_cavlc_fully_skipped_field_test", 4, 64, 32);
+        let (_, inferred_field_pair) = cavlc_mbaff_skipped_pair_cases();
+        assert!(
+            inferred_field_pair > 0,
+            "fixture must exercise a fully skipped pair inheriting field mode"
+        );
+    }
+
+    #[test]
+    fn test_cavlc_mbaff_field_mode_inference_order_and_slice_availability() {
+        let mut fields = [false, false, false, false, false, false];
+        let mut slices = [1u16; 12];
+
+        // Pair 4 has a true left neighbor and a false above neighbor.
+        fields[3] = true;
+        fields[1] = false;
+        assert!(inferred_pair_field_mode(4, 3, &fields, &slices, 1));
+
+        // If the left pair is outside this slice, the true above pair wins.
+        slices[6] = 2;
+        slices[7] = 2;
+        fields[1] = true;
+        assert!(inferred_pair_field_mode(4, 3, &fields, &slices, 1));
+
+        // A split pair above is unavailable, leaving the frame-mode default.
+        slices[2] = 2;
+        assert!(!inferred_pair_field_mode(4, 3, &fields, &slices, 1));
+        assert!(!inferred_pair_field_mode(0, 3, &fields, &slices, 1));
+    }
+
+
 }

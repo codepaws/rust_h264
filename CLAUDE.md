@@ -25,9 +25,22 @@ This is a Rust project using Cargo:
 
 ## Design Decisions
 
+- **Source provenance:** This project cannot use FFmpeg as an implementation source. Do not copy, translate, or adapt FFmpeg implementation code in changes; use the H.264 specification and independent derivations. Review existing source-specific references for provenance rather than simply erasing them. Golden-output comparisons against FFmpeg test output are a separate validation practice and do not establish source provenance.
 - **Input format:** Both Annex B (start code delimited) and AVCC (length-prefixed, MP4/MKV) are supported via `parse_annex_b` and `parse_avcc`/`parse_avcc_config` in `src/nal.rs`. The decoder itself accepts `NalUnit` values; the choice of parser determines the input format.
 - **Streaming API:** The decoder API is streaming — callers feed NAL units incrementally and receive decoded frames as they become available. No requirement to buffer an entire stream upfront.
 - **Performance:** The decoder should be fast. Prefer efficient algorithms, minimize allocations, and avoid unnecessary copies. Performance relative to ffmpeg's software decoder is a key benchmark.
+
+### H.264 source audit (bounded scope)
+
+The reference for this audit is [ITU-T H.264 (08/2021), official PDF](https://www.itu.int/rec/dologin_pub.asp?id=T-REC-H.264-202108-S%21%21PDF-E&lang=e&type=items). Chroma motion compensation was checked against clause 8.4.1.4 and Table 8-10; CABAC checks used clauses 7.3.4, 7.4.4, 9.3.3.1.1.1, and 9.3.3.1.1.2. Independent derivations were recorded before inspecting the corresponding local helpers. The threading worker pool and row-publication schedule are local implementation choices, not normative H.264 requirements or an FFmpeg dependency.
+
+No FFmpeg source was consulted in this audit pass. The historical source-specific citations appeared in upstream commits `48a2c552` (chroma) and `19affb9f` (CABAC), and fork commit `efffaf14` (threading). This was a bounded reimplementation and documentation audit of those areas; it is not a whole-repository provenance guarantee.
+
+The 2026-10-12 follow-up confirmed that commit `48a2c552` explicitly cited `FFmpeg h264_mb.c` for a field-chroma MV offset, and `19affb9f` referred to FFmpeg/x264 CABAC ordering without a precise source locator. These are provenance leads, not proof that the code was copied; the reviewed history cannot establish the algorithm's origin by itself. Commit `efffaf14` uses a high-level threading analogy and showed no implementation port in the inspected diff. No upstream/parent remote is configured, so comparison against an authoritative fork base was unavailable. The complete bounded review and limitations are recorded in the ignored working note `target/spec-audit/provenance-followup.md`; do not treat that temporary report as a whole-history certification.
+
+The MBAFF CABAC corpus exercises skipped-top/coded-bottom pairs with both signalled frame and field modes, plus fully skipped pairs. `mbaff_cabac_skipped_top_field_bottom_test` covers the field-mode transition with a four-frame 64x32 byte-exact fixture and a test-only branch counter. Its analytic source YUV was independently checked against FFmpeg decoder output. The transition follows H.264 clauses 7.3.4 and 7.4.4.
+
+The existing 64x64 CABAC MBAFF B-slice fixture now has a focused byte-exact regression that asserts 27 skipped and 30 direct B-slice macroblocks. It exercises frame-coded B macroblocks only; field-coded B-slice behavior remains uncovered.
 
 ## Code Structure
 

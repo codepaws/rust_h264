@@ -1,26 +1,25 @@
-//! Frame-level multithreaded decoding.
+//! Picture-level multithreaded decoding.
 //!
-//! The macroblock decode loop is inherently serial within a picture
-//! (CABAC neighbor dependencies), so parallelism comes from pipelining
-//! *pictures*. The coordinator thread does all header-level work in coded
-//! order — slice-header parsing, POC computation, reference-list
-//! construction — against a "shadow" DPB of planned pictures whose pixels
-//! have not been decoded yet. Worker threads run the per-picture MB decode
-//! loops and deblocking, then commit results back in coded order.
+//! The coordinator prepares slices in coded order, including picture order
+//! count, reference lists, and reference-picture marking. It records this
+//! metadata in a shadow decoded picture buffer (DPB) before worker threads
+//! decode the pictures. Each worker processes one picture's slices and
+//! macroblocks in order. H.264 defines the decoded sample and reference
+//! dependencies; this worker-pool schedule is an implementation choice.
 //!
-//! Because the shadow DPB replays exactly the same bookkeeping (insert,
-//! sliding window, MMCO) with the same metadata in the same order as the
-//! serial [`Decoder`](crate::decoder::Decoder), reference lists are
-//! identical by construction and decoded output is bit-exact with the
-//! serial path. The full test suite runs every multi-frame stream through
-//! this decoder and compares byte-for-byte.
+//! A planned reference has a shared picture slot. The coordinator fills the
+//! slot when it queues that picture, so a dependent worker can obtain the
+//! reference before its decode finishes. The producing worker copies each
+//! finalized macroblock row and its motion data into the shared picture,
+//! then publishes row progress with a release store. Reference readers wait
+//! for the pixel rows they need and acquire that progress before reading.
+//! Deblocking delays publication until a row's pixels are final; remaining
+//! rows are published when picture decoding finishes.
 //!
-//! Dependencies are tracked at picture granularity: a picture's MB decode
-//! starts once all its reference pictures have been committed (decoded,
-//! deblocked, and published). On typical B-frame content (e.g. x264
-//! `bframes=3`) this exposes 3-5 pictures of parallelism; pure P-chains
-//! reference their immediate predecessor and gain little — the same
-//! dependency structure FFmpeg's frame-threaded H.264 decoder exploits.
+//! Worker results may finish out of order. The coordinator collects them in
+//! coded order and then emits frames through a display-order reorder buffer.
+//! The shadow DPB applies the same reference bookkeeping as the serial
+//! [`Decoder`](crate::decoder::Decoder); tests compare their decoded output.
 //!
 //! Limitations: field pictures (interlaced coded as separate fields) are
 //! not supported and return an error — use the serial `Decoder` for
@@ -221,7 +220,7 @@ impl ThreadedDecoder {
             }
             NalUnitType::Pps => {
                 let pps_id_sps = {
-                    let mut peek = crate::bitstream::BitstreamReader::new(&nal.rbsp);
+                    let mut peek = crate::bitstream::BitstreamReader::new_borrowed(&nal.rbsp);
                     let _ = peek.read_ue();
                     peek.read_ue().ok()
                 };
@@ -231,7 +230,7 @@ impl ThreadedDecoder {
             }
             NalUnitType::Sei => {}
             NalUnitType::SliceIdr | NalUnitType::Slice => {
-                let mut peek = crate::bitstream::BitstreamReader::new(&nal.rbsp);
+                let mut peek = crate::bitstream::BitstreamReader::new_borrowed(&nal.rbsp);
                 let first_mb = peek.read_ue().unwrap_or(0);
                 let is_new_picture = first_mb == 0;
 
@@ -260,6 +259,7 @@ impl ThreadedDecoder {
                     &mut self.dpb,
                     &mut self.pending,
                     nal,
+                    None,
                 ) {
                     Ok((shell, ps)) => {
                         if shell.header.field_pic_flag {

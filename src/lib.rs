@@ -94,6 +94,9 @@ mod slice;
 
 mod slice_context;
 
+#[cfg(test)]
+mod mbaff_regression_tests;
+
 #[cfg(target_arch = "x86_64")]
 mod simd_x86;
 pub mod threading;

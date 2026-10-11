@@ -18,10 +18,75 @@ use crate::residual::{
 };
 use crate::slice_context::{SliceContext, SliceParams};
 
+#[cfg(test)]
+thread_local! {
+    static MBAFF_SKIPPED_TOP_TRANSITIONS: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn mbaff_skipped_top_transitions() -> (usize, usize, usize) {
+    MBAFF_SKIPPED_TOP_TRANSITIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_mbaff_skipped_top_transitions() {
+    MBAFF_SKIPPED_TOP_TRANSITIONS.with(|counts| counts.set((0, 0, 0)));
+}
+
+/// The field mode inferred for an MBAFF pair whose flag is absent.
+/// Neighbours outside this slice do not participate in the inference.
+fn inferred_pair_field_mode(
+    pair: usize,
+    mb_width: usize,
+    field_modes: &[bool],
+    slice_ids: &[u16],
+    current_slice: u16,
+) -> bool {
+    let neighbor_in_slice = |neighbor_pair: usize| {
+        slice_ids[neighbor_pair * 2] == current_slice
+            && slice_ids[neighbor_pair * 2 + 1] == current_slice
+    };
+    if pair % mb_width != 0 && neighbor_in_slice(pair - 1) {
+        field_modes[pair - 1]
+    } else if pair >= mb_width && neighbor_in_slice(pair - mb_width) {
+        field_modes[pair - mb_width]
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod mbaff_spec_tests {
+    use super::inferred_pair_field_mode;
+
+    #[test]
+    fn fully_skipped_pair_prefers_left_then_above_within_slice() {
+        // 3x2 pair grid. Pair 4 has pair 3 to its left and pair 1 above.
+        let mut fields = [false, true, false, false, false, false];
+        let mut slices = [1u16; 12];
+        assert!(!inferred_pair_field_mode(4, 3, &fields, &slices, 1));
+        fields[3] = true;
+        fields[1] = false;
+        assert!(inferred_pair_field_mode(4, 3, &fields, &slices, 1));
+        fields[1] = true;
+        slices[6] = 2;
+        slices[7] = 2;
+        assert!(inferred_pair_field_mode(4, 3, &fields, &slices, 1));
+        slices[7] = 1; // a split pair is still unavailable to this slice
+        assert!(inferred_pair_field_mode(4, 3, &fields, &slices, 1));
+        slices[7] = 2;
+        slices[2] = 2;
+        slices[3] = 2;
+        assert!(!inferred_pair_field_mode(4, 3, &fields, &slices, 1));
+    }
+}
+
 /// Result of decoding a single CABAC macroblock.
 pub(crate) enum CabacMbResult {
     /// MB decoded successfully; caller should increment mb_idx and continue.
     Decoded,
+    /// Top of an MBAFF pair was skipped; the bottom skip bin was consumed early.
+    DecodedWithBottomSkip(bool),
     /// End-of-slice detected via CABAC terminate; caller should break out of MB loop.
     EndOfSlice,
 }
@@ -43,12 +108,16 @@ impl SliceContext<'_> {
         let pair_addr = mb_idx / 2;
         let pair_col = pair_addr % self.mb_width as usize;
         let pair_row = pair_addr / self.mb_width as usize;
-        let cond_a = if pair_col > 0 {
+        let pair_available = |pair: usize| {
+            self.mb_slice_id[pair * 2] == self.this_slice_id
+                && self.mb_slice_id[pair * 2 + 1] == self.this_slice_id
+        };
+        let cond_a = if pair_col > 0 && pair_available(pair_addr - 1) {
             self.mb_field_decoding[pair_addr - 1] as u16
         } else {
             0
         };
-        let cond_b = if pair_row > 0 {
+        let cond_b = if pair_row > 0 && pair_available(pair_addr - self.mb_width as usize) {
             self.mb_field_decoding[pair_addr - self.mb_width as usize] as u16
         } else {
             0
@@ -67,6 +136,7 @@ impl SliceContext<'_> {
         mb_x: usize,
         mb_y: usize,
         sp: &SliceParams,
+        prefetched_skip: Option<bool>,
     ) -> Result<CabacMbResult, DecodeError> {
         // End-of-slice terminate: for non-MBAFF, decoded for every non-first MB.
         // For MBAFF, terminate is ONLY decoded at the END of bottom MBs (by the caller loop).
@@ -85,22 +155,10 @@ impl SliceContext<'_> {
             return Ok(CabacMbResult::EndOfSlice);
         }
 
-        // Select field or frame coefficient scan tables
-        let field_scan = self.is_field_scan(mb_idx);
-        let zigzag_4x4 = if field_scan { &ZIGZAG_4X4_FIELD } else { &ZIGZAG_4X4 };
-        let zigzag_8x8_cabac = if field_scan {
-            &ZIGZAG_8X8_CABAC_FIELD
-        } else {
-            &ZIGZAG_8X8_CABAC
-        };
-
         // MBAFF: decode mb_field_decoding_flag (spec 7.3.4, contexts 70-72)
         // For I-slices: decoded for all top MBs.
-        // For P/B-slices: the ordering is skip-first, then field_flag if NOT skipped.
-        //   - Top MB: decode skip first. If skipped, immediately decode bottom skip.
-        //     Field_flag is decoded only when a non-skipped MB is found.
-        //   - Bottom MB (when top was skipped): skip first, then field_flag if not skipped.
-        // This matches FFmpeg/x264's CABAC encoding order.
+        // For P/B-slices: skip precedes the pair field flag. If the top is
+        // skipped, the bottom skip bin must be read before its optional flag.
         if self.mbaff && !(sp.is_p_slice || sp.is_b_slice) {
             // I-slice: field_flag for all top MBs (no skip flags exist)
             if mb_idx.is_multiple_of(2) {
@@ -112,6 +170,26 @@ impl SliceContext<'_> {
         if !(sp.is_p_slice || sp.is_b_slice) {
             self.set_mb_layout(mb_idx, mb_x, mb_y);
         }
+
+        // 9.3.3.1.1.1 uses the inferred pair mode when the flag is not yet coded.
+        if self.mbaff && (sp.is_p_slice || sp.is_b_slice) && mb_idx.is_multiple_of(2) {
+            self.mb_field_decoding[mb_idx / 2] = inferred_pair_field_mode(
+                mb_idx / 2,
+                self.mb_width as usize,
+                self.mb_field_decoding,
+                self.mb_slice_id,
+                self.this_slice_id,
+            );
+        }
+
+        // Scan selection below is refreshed after any signalled pair field flag.
+        let field_scan = self.is_field_scan(mb_idx);
+        let zigzag_4x4 = if field_scan { &ZIGZAG_4X4_FIELD } else { &ZIGZAG_4X4 };
+        let zigzag_8x8_cabac = if field_scan {
+            &ZIGZAG_8X8_CABAC_FIELD
+        } else {
+            &ZIGZAG_8X8_CABAC
+        };
 
         // P/B-slice CABAC path
         if sp.is_p_slice || sp.is_b_slice {
@@ -127,22 +205,44 @@ impl SliceContext<'_> {
             } else {
                 true
             };
-            let is_skip = cr.decode_mb_skip(st, left_skip, top_skip, sp.is_b_slice);
+            let is_skip = prefetched_skip
+                .unwrap_or_else(|| cr.decode_mb_skip(st, left_skip, top_skip, sp.is_b_slice));
+
+            // A skipped top MB cannot be reconstructed until the pair field
+            // mode is known (7.4.4). Parse the bottom skip bin now; if the
+            // bottom is coded, its field flag supplies the mode for both MBs.
+            let bottom_skip = if self.mbaff && mb_idx.is_multiple_of(2) && is_skip {
+                self.mb_skip[mb_idx] = true;
+                let bottom = mb_idx + 1;
+                self.mb_slice_id[bottom] = self.this_slice_id;
+                let left_skip = self.left_mb(bottom).map_or(true, |n| self.mb_skip[n]);
+                let top_skip = self.above_mb(bottom).map_or(true, |n| self.mb_skip[n]);
+                let skipped = cr.decode_mb_skip(st, left_skip, top_skip, sp.is_b_slice);
+                if !skipped {
+                    self.decode_mbaff_field_flag(cr, st, bottom);
+                }
+                #[cfg(test)]
+                MBAFF_SKIPPED_TOP_TRANSITIONS.with(|counts| {
+                    let (coded_bottom, skipped_bottom, coded_field_bottom) = counts.get();
+                    counts.set(if skipped {
+                        (coded_bottom, skipped_bottom + 1, coded_field_bottom)
+                    } else {
+                        (coded_bottom + 1, skipped_bottom,
+                         coded_field_bottom + usize::from(self.mb_field_decoding[mb_idx / 2]))
+                    });
+                });
+                Some(skipped)
+            } else {
+                None
+            };
 
             // MBAFF: after skip flag, handle field_flag based on skip result
             if self.mbaff {
                 let is_top = mb_idx.is_multiple_of(2);
-                if is_top && is_skip {
-                    // Top MB is skipped. Check bottom skip immediately (FFmpeg pattern).
-                    // The bottom's skip_flag is decoded WITHOUT field_flag first.
-                    // Field_flag is only decoded if the bottom is NOT skipped.
-                    // Store this skip result for the current top MB.
-                    // The bottom will be handled in the next iteration.
-                    // NO field_flag decoded for fully-skipped pair.
-                } else if is_top && !is_skip {
+                if is_top && !is_skip {
                     // Top MB is NOT skipped. Decode field_flag now before macroblock_layer.
                     self.decode_mbaff_field_flag(cr, st, mb_idx);
-                } else if !is_top && self.mb_skip[mb_idx - 1] && !is_skip {
+                } else if !is_top && prefetched_skip.is_none() && self.mb_skip[mb_idx - 1] && !is_skip {
                     // Bottom MB NOT skipped, but top was skipped.
                     // Decode field_flag now.
                     self.decode_mbaff_field_flag(cr, st, mb_idx);
@@ -150,6 +250,14 @@ impl SliceContext<'_> {
                 // Bottom MB skipped (regardless of top): no field_flag needed.
             }
             self.set_mb_layout(mb_idx, mb_x, mb_y);
+
+            let field_scan = self.is_field_scan(mb_idx);
+            let zigzag_4x4 = if field_scan { &ZIGZAG_4X4_FIELD } else { &ZIGZAG_4X4 };
+            let zigzag_8x8_cabac = if field_scan {
+                &ZIGZAG_8X8_CABAC_FIELD
+            } else {
+                &ZIGZAG_8X8_CABAC
+            };
 
             if is_skip {
                 self.mb_skip[mb_idx] = true;
@@ -171,7 +279,10 @@ impl SliceContext<'_> {
                     ..Default::default()
                 };
                 self.last_qp_delta_nonzero = false;
-                return Ok(CabacMbResult::Decoded);
+                return Ok(match bottom_skip {
+                    Some(skipped) => CabacMbResult::DecodedWithBottomSkip(skipped),
+                    None => CabacMbResult::Decoded,
+                });
             }
 
             // Non-skip: decode mb_type
@@ -1177,8 +1288,9 @@ impl SliceContext<'_> {
                             }
                             let mut cb_pred = [0u8; 64]; // stack: max 8x8
                             let mut cr_pred_buf = [0u8; 64]; // stack: max 8x8
-                            let cmv_y = mv[1] as i32 + crate::slice_context::chroma_field_mv_offset_impl(
-                                self.field_pic_flag, self.bottom_field_flag, ref_pic);
+                            let cmv_y = mv[1] as i32 + crate::slice_context::chroma_mb_field_mv_offset_impl(
+                                self.field_pic_flag, self.bottom_field_flag, self.mbaff,
+                                self.mb_field_decoding, mb_idx, sub_ref[smb], ref_pic);
                             inter_pred::chroma_mc(
                                 &ref_pic.u[c_ref_off..],
                                 c_ref_stride,
@@ -1378,8 +1490,9 @@ impl SliceContext<'_> {
                         let chh = part_h.max(2) / 2;
                         let mut cb_pred = [0u8; 64]; // stack: max 8x8
                         let mut cr_pred_buf = [0u8; 64]; // stack: max 8x8
-                        let cmv_y = mv[1] as i32 + crate::slice_context::chroma_field_mv_offset_impl(
-                            self.field_pic_flag, self.bottom_field_flag, ref_pic);
+                        let cmv_y = mv[1] as i32 + crate::slice_context::chroma_mb_field_mv_offset_impl(
+                            self.field_pic_flag, self.bottom_field_flag, self.mbaff,
+                            self.mb_field_decoding, mb_idx, part_ref[p], ref_pic);
                         inter_pred::chroma_mc(
                             &ref_pic.u[c_ref_off..],
                             c_ref_stride,
@@ -2891,10 +3004,12 @@ impl SliceContext<'_> {
                             let mut c0 = vec![0u8; chw * chh];
                             let mut c1 = vec![0u8; chw * chh];
                             let cy_off = sub_part.y / 2;
-                            let cmv_y_l0 = sub_part.mv_l0[1] as i32 + crate::slice_context::chroma_field_mv_offset_impl(
-                                self.field_pic_flag, self.bottom_field_flag, ref_l0);
-                            let cmv_y_l1 = sub_part.mv_l1[1] as i32 + crate::slice_context::chroma_field_mv_offset_impl(
-                                self.field_pic_flag, self.bottom_field_flag, ref_l1);
+                            let cmv_y_l0 = sub_part.mv_l0[1] as i32 + crate::slice_context::chroma_mb_field_mv_offset_impl(
+                                self.field_pic_flag, self.bottom_field_flag, self.mbaff,
+                                self.mb_field_decoding, mb_idx, sub_part.ref_idx_l0, ref_l0);
+                            let cmv_y_l1 = sub_part.mv_l1[1] as i32 + crate::slice_context::chroma_mb_field_mv_offset_impl(
+                                self.field_pic_flag, self.bottom_field_flag, self.mbaff,
+                                self.mb_field_decoding, mb_idx, sub_part.ref_idx_l1, ref_l1);
                             inter_pred::chroma_mc(
                                 cr0,
                                 c_ref_stride_l0,
@@ -2947,8 +3062,9 @@ impl SliceContext<'_> {
                                 &ref_pic.v[c_ref_off..]
                             };
                             let cy_off = sub_part.y / 2;
-                            let cmv_y = sub_part.mv_l0[1] as i32 + crate::slice_context::chroma_field_mv_offset_impl(
-                                self.field_pic_flag, self.bottom_field_flag, ref_pic);
+                            let cmv_y = sub_part.mv_l0[1] as i32 + crate::slice_context::chroma_mb_field_mv_offset_impl(
+                                self.field_pic_flag, self.bottom_field_flag, self.mbaff,
+                                self.mb_field_decoding, mb_idx, sub_part.ref_idx_l0, ref_pic);
                             inter_pred::chroma_mc(
                                 plane,
                                 c_ref_stride,
@@ -2989,8 +3105,9 @@ impl SliceContext<'_> {
                                 &ref_pic.v[c_ref_off..]
                             };
                             let cy_off = sub_part.y / 2;
-                            let cmv_y = sub_part.mv_l1[1] as i32 + crate::slice_context::chroma_field_mv_offset_impl(
-                                self.field_pic_flag, self.bottom_field_flag, ref_pic);
+                            let cmv_y = sub_part.mv_l1[1] as i32 + crate::slice_context::chroma_mb_field_mv_offset_impl(
+                                self.field_pic_flag, self.bottom_field_flag, self.mbaff,
+                                self.mb_field_decoding, mb_idx, sub_part.ref_idx_l1, ref_pic);
                             inter_pred::chroma_mc(
                                 plane,
                                 c_ref_stride,
