@@ -457,6 +457,21 @@ P-only case remains slower than 1 thread.)
   the plumbing — that is the frame-dispatched endgame still queued.
   MC, no per-block calls), not further filter work. Per-block timing
   was reverted after measurement (~100k MC calls/frame make timer
+- **AVX2 half-pel kernels attempted and reverted** (fd79ac0, 5d7c236;
+  reverted in the two commits above them): `vpmovzxbw`-widened YMM FIR
+  for the 16-wide chunks of the h and v kernels, bit-exact and
+  differentially tested — but a consistent **regression on a quiet
+  machine** (4 interleaved rounds: 720p P-only 248->227 fps ≈ -5%,
+  1080p slightly down, B neutral). Root cause is the one this file
+  already documented for the deblock kernels: `#[target_feature]`
+  functions cannot inline into non-gated callers, so every 16-pixel
+  chunk paid a real function call while the SSE2 body inlines freely
+  into the always-inline chain. The kernels are preserved in history
+  and are correct — they return as *inlined bodies inside
+  feature-gated whole-arm loops* in the frame-dispatched MC work,
+  where the arm itself is `#[target_feature(enable="avx2")]` and the
+  call boundary disappears. That is the standing design for the
+  whole-MB fusion; do not re-add out-of-line AVX2 kernels.
   overhead exceed the work being measured); only the cheap
   row-granular deblock accumulator ships.
 - **FFmpeg single-threaded is 2.6-3.4x faster than our best threaded
