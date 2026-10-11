@@ -1114,6 +1114,12 @@ pub fn chroma_mc_strided(
     if (block_h - 1) * out_stride + block_w > output.len() {
         return;
     }
+    // Field-coded MBAFF may pass the frame height with a doubled field stride.
+    // Clamp to the available rows before either full-pel path samples the plane.
+    let ref_height = ref_plane
+        .len()
+        .checked_div(ref_width)
+        .map_or(ref_height, |available| ref_height.min(available));
     let frac_x = dx.rem_euclid(8);
     let frac_y = dy.rem_euclid(8);
     let x_int = x + (dx >> 3);
@@ -1388,6 +1394,47 @@ pub fn weighted_bi_implicit(pred_l0: &[u8], pred_l1: &[u8], output: &mut [u8], w
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn strided_chroma_zero_reference_stride_preserves_padding() {
+        for (dx, dy) in [(0, 0), (1, 1)] {
+            let mut packed = [199u8; 8];
+            let mut strided = [199u8; 12];
+            chroma_mc(&[73; 32], 0, 32, 0, 0, dx, dy, 4, 2, &mut packed);
+            chroma_mc_strided(&[73; 32], 0, 32, 0, 0, dx, dy, 4, 2, &mut strided, 8);
+            assert_eq!(packed, [0; 8]);
+            assert_eq!(&strided[..4], &packed[..4]);
+            assert_eq!(&strided[8..], &packed[4..]);
+            assert_eq!(&strided[4..8], &[199; 4]);
+        }
+    }
+
+    #[test]
+    fn strided_chroma_replicates_field_bottom_and_preserves_padding() {
+        let plane = [73u8; 1024];
+        for field_offset in [0, 32] {
+            for y in [8, 15] {
+                let field = &plane[field_offset..];
+                let mut packed = [0u8; 64];
+                let mut strided = [199u8; 456];
+                chroma_mc(field, 64, 32, 8, y, 0, 8, 8, 8, &mut packed);
+                chroma_mc_strided(field, 64, 32, 8, y, 0, 8, 8, 8, &mut strided, 64);
+                assert_eq!(packed, [73; 64]);
+                for row in 0..8 {
+                    assert_eq!(
+                        &strided[row * 64..row * 64 + 8],
+                        &packed[row * 8..row * 8 + 8],
+                        "field {field_offset}, y {y}, row {row}"
+                    );
+                    if row < 7 {
+                        assert!(strided[row * 64 + 8..(row + 1) * 64]
+                            .iter()
+                            .all(|&v| v == 199));
+                    }
+                }
+            }
+        }
+    }
 
     fn make_ref_pic(width: u32, height: u32, y_data: Vec<u8>) -> Arc<DecodedPicture> {
         let uv_size = (width / 2 * height / 2) as usize;
