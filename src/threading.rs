@@ -98,6 +98,8 @@ struct Pool {
     queue: Mutex<VecDeque<PoolTask>>,
     cv: Condvar,
     shutdown: Mutex<bool>,
+    #[cfg(test)]
+    after_clear: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// H.264 decoder that pipelines pictures across worker threads and emits
@@ -396,6 +398,8 @@ impl ThreadedDecoder {
                 queue: Mutex::new(VecDeque::new()),
                 cv: Condvar::new(),
                 shutdown: Mutex::new(false),
+                #[cfg(test)]
+                after_clear: Mutex::new(None),
             });
             let mut handles = Vec::with_capacity(self.threads);
             for _ in 0..self.threads {
@@ -755,8 +759,12 @@ impl Drop for ThreadedDecoder {
             {
                 let mut q = pool.queue.lock().unwrap_or_else(|e| e.into_inner());
                 q.clear();
-            }
-            {
+                #[cfg(test)]
+                if let Some(hook) = pool.after_clear.lock().unwrap().take() {
+                    hook();
+                }
+                // Keep the queue predicate mutex held until shutdown changes.
+                // A worker cannot check false and then miss notify_all before wait.
                 let mut flag = pool.shutdown.lock().unwrap_or_else(|e| e.into_inner());
                 *flag = true;
             }
@@ -772,6 +780,48 @@ impl Drop for ThreadedDecoder {
 mod tests {
     use super::*;
     use crate::nal::parse_annex_b;
+
+    #[test]
+    fn shutdown_keeps_queue_locked_until_predicate_changes() {
+        let pool = Arc::new(Pool {
+            queue: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+            shutdown: Mutex::new(false),
+            after_clear: Mutex::new(None),
+        });
+        let (cleared_tx, cleared_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *pool.after_clear.lock().unwrap() = Some(Box::new(move || {
+            cleared_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        }));
+        let mut decoder = ThreadedDecoder::new(1);
+        decoder.pool = Some(pool.clone());
+        let dropper = std::thread::spawn(move || drop(decoder));
+        cleared_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        // A worker must not enter the empty-queue/false-shutdown gap here.
+        let queue_is_locked = pool.queue.try_lock().is_err();
+        resume_tx.send(()).unwrap();
+        dropper.join().unwrap();
+        assert!(
+            queue_is_locked,
+            "worker can check the predicate before shutdown and miss its notification"
+        );
+        assert!(*pool.shutdown.lock().unwrap());
+        // The real worker sees the terminal predicate and exits without work.
+        let (done_tx, _) = std::sync::mpsc::channel();
+        let (exited_tx, exited_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            pool_worker(pool, done_tx);
+            exited_tx.send(()).unwrap();
+        });
+        exited_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        worker.join().unwrap();
+    }
 
     /// Decode a stream serially (OrderedDecoder) and threaded, compare the
     /// full display-order frame streams byte-for-byte.
